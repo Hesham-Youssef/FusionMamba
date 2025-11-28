@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from mamba_ssm.modules.mamba_simple import Mamba
-from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 
 
 class SingleMambaBlock(nn.Module):
@@ -74,3 +74,4 @@ class FusionMamba(nn.Module):
             return output
         else:
             return (pan + output) / 2, (ms + output) /2
+
