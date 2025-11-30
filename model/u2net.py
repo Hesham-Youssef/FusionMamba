@@ -110,23 +110,25 @@ class Stage(nn.Module):
         super().__init__()
         self.fm = FusionMamba(in_channels, H, W)
         if sample_mode == 'down':
-            self.sample = Down(in_channels, out_channels, scale)
-        elif sample_mode == 'up':
-            self.sample = Up(in_channels, out_channels, scale)
-
-    def forward(self, pan, ms, pan_pre=None, ms_pre=None):
-        pan, ms = self.fm(pan, ms)
-        if pan_pre is None:
-            pan_skip = pan
-            ms_skip = ms
-            pan = self.sample(pan)
-            ms = self.sample(ms)
-            return pan, ms, pan_skip, ms_skip
+            self.sample_pan = Down(in_channels, out_channels, scale)
+            self.sample_ms  = Down(in_channels, out_channels, scale)
         else:
-            pan = self.sample(pan, pan_pre)
-            ms = self.sample(ms, ms_pre)
-            return pan, ms
+            self.upsample_pan = Up(in_channels, out_channels, scale)
+            self.upsample_ms  = Up(in_channels, out_channels, scale)
+        self.sample_mode = sample_mode
 
+
+    def forward(self, pan, ms, pan_skip=None, ms_skip=None):
+        pan, ms = self.fm(pan, ms)
+        if self.sample_mode == 'down':
+            pan_skip, ms_skip = pan, ms
+            pan_down = self.sample_pan(pan)
+            ms_down  = self.sample_ms(ms)
+            return pan_down, ms_down, pan_skip, ms_skip
+        else:
+            pan_up = self.upsample_pan(pan, pan_skip)
+            ms_up  = self.upsample_ms(ms, ms_skip)
+            return pan_up, ms_up
 
 class SpeAttention(nn.Module):
     def __init__(self, spe_channels, se_ratio=8, mode='mamba', channels=32):

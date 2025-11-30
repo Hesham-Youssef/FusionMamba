@@ -13,14 +13,42 @@ from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
 from model.u2net import U2Net as Net
 from torch.utils.data import DataLoader
-from utils.load_train_data import Dataset_Pro
-
+# from utils.load_train_data import Dataset_Pro
+from utils.hdr_load_train_data import HDRDataset
 
 SEED = 1
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 cudnn.benchmark = True
+
+import cv2
+
+def save_batch_debug(gt, ldr_short, ldr_long, sr, epoch, iteration):
+    out_dir = f"debug/epoch_{epoch}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Save LDR as PNG (still needed)
+    def to_uint8_ldr_raw(x):
+        img = x[0].detach().cpu().permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 255)
+        return img.astype('uint8')
+
+    # Save HDR without tone-mapping
+    def to_hdr(x):
+        img = x[0].detach().cpu().permute(1,2,0).numpy().astype(np.float32)
+        if img.shape[2] == 3:
+            img = img[..., ::-1]  # RGB -> BGR
+        return img
+
+    cv2.imwrite(os.path.join(out_dir, f"ldr_short_{iteration}.png"), to_uint8_ldr_raw(ldr_short))
+    cv2.imwrite(os.path.join(out_dir, f"ldr_long_{iteration}.png"), to_uint8_ldr_raw(ldr_long))
+
+    # Save HDR
+    cv2.imwrite(os.path.join(out_dir, f"gt_{iteration}.hdr"), to_hdr(gt))
+    cv2.imwrite(os.path.join(out_dir, f"sr_{iteration}.hdr"), to_hdr(sr))
+
+
 
 
 def save_checkpoint(args, model, epoch):
@@ -31,21 +59,32 @@ def save_checkpoint(args, model, epoch):
 
 
 def prepare_training_data(args):
-    train_set = Dataset_Pro(args.train_data_path)
-    validate_set = Dataset_Pro(args.val_data_path)
-    training_data_loader = DataLoader(dataset=train_set, num_workers=0, batch_size=args.batch_size,
-                                      shuffle=True, pin_memory=True, drop_last=True)
-    validate_data_loader = DataLoader(dataset=validate_set, num_workers=0, batch_size=args.batch_size,
-                                      shuffle=True, pin_memory=True, drop_last=True)
+    # make sure train/val datasets use the same H,W,ratio the model will use
+    train_set = HDRDataset(args.train_data_path,
+                           target_H=args.H,
+                           target_W=args.W,
+                           ratio=args.ratio,
+                           random_crop=True)
+    validate_set = HDRDataset(args.val_data_path,
+                              target_H=args.H,
+                              target_W=args.W,
+                              ratio=args.ratio,
+                              random_crop=False)
+
+    training_data_loader = DataLoader(dataset=train_set, num_workers=os.cpu_count(), batch_size=args.batch_size,
+                                      shuffle=True, pin_memory=False, drop_last=False)
+    validate_data_loader = DataLoader(dataset=validate_set, num_workers=os.cpu_count(), batch_size=args.batch_size,
+                                      shuffle=False, pin_memory=False, drop_last=False)
     return training_data_loader, validate_data_loader
 
 
 def train(args, training_data_loader, validate_data_loader):
-    model = Net(args.channels, args.spa_channels, args.spe_channels, args.H, args.W, args.ratio).to(args.device)
-    summary(model, input_size=[(args.batch_size, args.spe_channels, 16, 16),
-                               (args.batch_size, args.spa_channels, 64, 64)],
-            dtypes=[torch.float, torch.float])
-
+    model = Net(args.channels, args.first_channels, args.second_channels, args.H, args.W, args.ratio).to(args.device)
+    short_H = args.H // args.ratio
+    short_W = args.W // args.ratio
+    summary(model, input_size=[(args.batch_size, 3, short_H, short_W),
+                            (args.batch_size, 3, args.H, args.W)], dtypes=[torch.float, torch.float])
+    
     if args.use_ergas is True:
         criterion0 = nn.L1Loss(size_average=True).to(args.device)
         criterion1 = ERGAS(args.ratio).to(args.device)
@@ -65,9 +104,18 @@ def train(args, training_data_loader, validate_data_loader):
         epoch_train_loss0 = []
         epoch_train_loss1 = []
         for iteration, batch in enumerate(training_data_loader, 1):
-            gt, pan, ms = batch[0].to(args.device), batch[3].to(args.device), batch[4].to(args.device)
+            gt, ldr_short, ldr_long = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device)
+            
             optimizer.zero_grad()
-            sr = model(ms, pan)
+            sr = model(ldr_short, ldr_long)
+            
+            # -------------------------------------------------------
+            # Save first batch of first epoch for debugging (GT, inputs, SR)
+            # -------------------------------------------------------
+            # if epoch == 1 and iteration == 1:
+            # save_batch_debug(gt, ldr_short, ldr_long, sr, epoch, iteration)
+            # -------------------------------------------------------
+
             if args.use_ergas is True:
                 loss0 = criterion0(sr, gt)
                 loss1 = criterion1(sr, gt)
@@ -96,8 +144,8 @@ def train(args, training_data_loader, validate_data_loader):
                 epoch_val_loss0 = []
                 epoch_val_loss1 = []
                 for iteration, batch in enumerate(validate_data_loader, 1):
-                    gt, pan, ms = batch[0].to(args.device), batch[3].to(args.device), batch[4].to(args.device)
-                    sr = model(ms, pan)
+                    gt, ldr_short, ldr_long = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device)
+                    sr = model(ldr_short, ldr_long)
                     if args.use_ergas is True:
                         loss0 = criterion0(sr, gt)
                         loss1 = criterion1(sr, gt)
@@ -122,16 +170,18 @@ def train(args, training_data_loader, validate_data_loader):
             save_checkpoint(args, model, epoch)
         else:
             continue
+        
+    save_checkpoint(args, model, args.epoch)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ratio', type=int, default=4, help='Upsample ratio')
+    parser.add_argument('--ratio', type=int, default=1, help='Upsample ratio')
     parser.add_argument('--H', type=int, default=64, help='Height of the high-resolution image')
     parser.add_argument('--W', type=int, default=64, help='Width of the high-resolution image')
     parser.add_argument('--channels', type=int, default=32, help='Feature channels')
-    parser.add_argument('--spa_channels', type=int, default=1, help='Spatial channels')
-    parser.add_argument('--spe_channels', type=int, default=8, help='Spectral channels')
+    parser.add_argument('--first_channels', type=int, default=3, help='Spatial channels')
+    parser.add_argument('--second_channels', type=int, default=3, help='Spectral channels')
     parser.add_argument('--use_ergas', type=bool, default=False, help='Use ERGAS loss for training or not')
     parser.add_argument('--ergas_hp', type=float, default=1e-4, help='Hyper-parameter for the ERGAS loss')
     parser.add_argument('--epoch', type=int, default=500, help='Epochs')
