@@ -51,11 +51,21 @@ def save_batch_debug(gt, ldr_short, ldr_long, sr, epoch, iteration):
 
 
 
-def save_checkpoint(args, model, epoch):
+def save_checkpoint(args, model, optimizer, scheduler, epoch):
     if not os.path.exists(args.weight_dir):
         os.mkdir(args.weight_dir)
-    model_out_path = args.weight_dir + "{}.pth".format(epoch)
-    torch.save(model.state_dict(), model_out_path)
+
+    save_path = os.path.join(args.weight_dir, f"{epoch}.pth")
+
+    torch.save({
+        'epoch': epoch,
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict()
+    }, save_path)
+
+    print(f"Checkpoint saved: {save_path}")
+
 
 
 def prepare_training_data(args):
@@ -71,10 +81,12 @@ def prepare_training_data(args):
                               ratio=args.ratio,
                               random_crop=False)
 
-    training_data_loader = DataLoader(dataset=train_set, num_workers=os.cpu_count(), batch_size=args.batch_size,
-                                      shuffle=True, pin_memory=False, drop_last=False)
-    validate_data_loader = DataLoader(dataset=validate_set, num_workers=os.cpu_count(), batch_size=args.batch_size,
-                                      shuffle=False, pin_memory=False, drop_last=False)
+    training_data_loader = DataLoader(dataset=train_set, num_workers=2, batch_size=16,
+                                      shuffle=True, pin_memory=False, drop_last=False,
+                                      prefetch_factor=1)
+    validate_data_loader = DataLoader(dataset=validate_set, num_workers=2, batch_size=16,
+                                      shuffle=False, pin_memory=False, drop_last=False,
+                                      prefetch_factor=1)
     return training_data_loader, validate_data_loader
 
 
@@ -93,11 +105,25 @@ def train(args, training_data_loader, validate_data_loader):
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=args.step, gamma=args.decay)
 
+    start_epoch = 1
+
+    if args.resume_path is not None and os.path.isfile(args.resume_path):
+        print(f"Loading checkpoint: {args.resume_path}")
+        checkpoint = torch.load(args.resume_path, map_location=args.device)
+
+        model.load_state_dict(checkpoint['model_state'])
+        optimizer.load_state_dict(checkpoint['optimizer_state'])
+        lr_scheduler.load_state_dict(checkpoint['scheduler_state'])
+
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed training from epoch {start_epoch}")
+
+    
     t_start = time.time()
     print('Start training...')
-
+    end_epoch = args.epoch + start_epoch - 1
     # train
-    for epoch in range(0, args.epoch, 1):
+    for epoch in range(start_epoch, end_epoch, 1):
         epoch += 1
         model.train()
         epoch_train_loss = []
@@ -131,10 +157,10 @@ def train(args, training_data_loader, validate_data_loader):
         t_loss = np.nanmean(np.array(epoch_train_loss))
         if args.use_ergas is True:
             print('Epoch: {}/{}  training loss: {:.7f}  l1: {:.7f}  ergas: {:.7f}'
-                  .format(epoch, args.epoch, t_loss, np.nanmean(np.array(epoch_train_loss0)),
+                  .format(epoch, end_epoch, t_loss, np.nanmean(np.array(epoch_train_loss0)),
                           np.nanmean(np.array(epoch_train_loss1))))
         else:
-            print('Epoch: {}/{}  training loss: {:.7f}'.format(epoch, args.epoch, t_loss))
+            print('Epoch: {}/{}  training loss: {:.7f}'.format(epoch, end_epoch, t_loss))
 
         # validate
         with torch.no_grad():
@@ -167,11 +193,11 @@ def train(args, training_data_loader, validate_data_loader):
 
         # save weights
         if epoch % args.ckpt == 0:
-            save_checkpoint(args, model, epoch)
+            save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
         else:
             continue
         
-    save_checkpoint(args, model, args.epoch)
+    save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
 
 
 if __name__ == "__main__":
@@ -194,6 +220,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_data_path', type=str, default='', help='Path of the training dataset.')
     parser.add_argument('--val_data_path', type=str, default='', help='Path of the validation dataset.')
     parser.add_argument('--weight_dir', type=str, default='weights/', help='Dir of the weight.')
+    parser.add_argument('--resume_path', type=str, default=None, help='Path to checkpoint to resume training from')
     args = parser.parse_args()
 
     training_data_loader, validate_data_loader = prepare_training_data(args)

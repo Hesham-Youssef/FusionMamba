@@ -4,6 +4,7 @@ import torch.utils.data as data
 import cv2
 import os
 import numpy as np
+import glob
 
 class HDRDataset(data.Dataset):
     """
@@ -31,8 +32,8 @@ class HDRDataset(data.Dataset):
             scene_path = os.path.join(data_dir, scene)
             if not os.path.isdir(scene_path):
                 continue
-            ldr_files = sorted([f for f in os.listdir(scene_path) if f.lower().endswith('.tif')])
-            hdr_list = [f for f in os.listdir(scene_path) if f.lower().endswith('.hdr')]
+            ldr_files = sorted(glob.glob(os.path.join(scene_path, "input_*_aligned.tif")))
+            hdr_list = sorted(glob.glob(os.path.join(scene_path, "ref_hdr_aligned.hdr")))
             if len(hdr_list) == 0:
                 raise RuntimeError(f"No .hdr file found in {scene_path}")
             hdr_file = hdr_list[0]
@@ -68,9 +69,11 @@ class HDRDataset(data.Dataset):
         pair = self.pairs[idx]
         scene_path = pair['scene_path']
 
-        ldr1 = cv2.imread(os.path.join(scene_path, pair['ldr1']), cv2.IMREAD_UNCHANGED)
-        ldr2 = cv2.imread(os.path.join(scene_path, pair['ldr2']), cv2.IMREAD_UNCHANGED)
-        gt_hdr = cv2.imread(os.path.join(scene_path, pair['hdr']), -1)  # float32 HDR
+        ldr1 = cv2.imread(pair['ldr1'], cv2.IMREAD_UNCHANGED)
+        ldr2 = cv2.imread(pair['ldr2'], cv2.IMREAD_UNCHANGED)
+        gt_hdr = cv2.imread(pair['hdr'], -1)  # float32 HDR
+        
+        # print(f'loading {pair['ldr1']} {pair['ldr2']} {pair['hdr']}')
         
         if ldr1 is None or ldr2 is None or gt_hdr is None:
             raise RuntimeError(f"Failed to read files in {scene_path}: {pair}")
