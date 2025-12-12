@@ -97,23 +97,22 @@ class HDRDataset(data.Dataset):
         ldr1_c, ldr2_c, gt_c = self._consistent_crop_or_resize([ldr1, ldr2, gt_hdr])
 
         # ldr_long: use ldr1_c resized/cropped -> (target_H, target_W)
-        ldr_long = ldr1_c
 
         # ldr_short: downsample ldr2_c from (target_H,target_W) -> (target_H/ratio, target_W/ratio)
-        sh, sw = self.target_H // self.ratio, self.target_W // self.ratio
-        ldr_short = cv2.resize(ldr2_c, (sw, sh), interpolation=cv2.INTER_AREA)
+        # sh, sw = self.target_H // self.ratio, self.target_W // self.ratio
+        # ldr_short = cv2.resize(ldr2_c, (sw, sh), interpolation=cv2.INTER_AREA)
 
         # gt: optionally log-space
         if self.use_log:
             gt_c = np.log1p(gt_c)
 
         # To tensors (C,H,W)
-        ldr_short = torch.from_numpy(ldr_short).permute(2,0,1).float()
-        ldr_long  = torch.from_numpy(ldr_long).permute(2,0,1).float()
-        gt_hdr    = torch.from_numpy(gt_c).permute(2,0,1).float()
+        ldr1_c = torch.from_numpy(ldr1_c).permute(2,0,1).float()
+        ldr2_c  = torch.from_numpy(ldr2_c).permute(2,0,1).float()
+        gt_c    = torch.from_numpy(gt_c).permute(2,0,1).float()
 
         # Optional transform
         if self.transform:
-            ldr_short, ldr_long, gt_hdr = self.transform(ldr_short, ldr_long, gt_hdr)
+            ldr1_c, ldr2_c, gt_c = self.transform(ldr1_c, ldr2_c, gt_c)
 
-        return gt_hdr, ldr_short, ldr_long
+        return gt_c, ldr1_c, ldr2_c

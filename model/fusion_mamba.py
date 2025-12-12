@@ -51,27 +51,29 @@ class FusionMamba(nn.Module):
         self.spa_mamba_layers = nn.ModuleList([])
         self.spe_mamba_layers = nn.ModuleList([])
         for _ in range(depth):
-            self.spa_mamba_layers.append(SingleMambaBlock(dim, H, W))
-            self.spe_mamba_layers.append(SingleMambaBlock(dim, H, W))
+            self.spa_mamba_layers.append(CrossMambaBlock(dim, H, W))
+            self.spe_mamba_layers.append(CrossMambaBlock(dim, H, W))
         self.spa_cross_mamba = CrossMambaBlock(dim, H, W)
         self.spe_cross_mamba = CrossMambaBlock(dim, H, W)
         self.out_proj = nn.Linear(dim, dim)
 
-    def forward(self, pan, ms):
-        b, c, h, w = pan.shape
-        pan = rearrange(pan, 'b c h w -> b (h w) c', h=h, w=w)
-        ms = rearrange(ms, 'b c h w -> b (h w) c', h=h, w=w)
+    def forward(self, img1, img2, img1_sum, img2_sum):
+        b, c, h, w = img1.shape
+        img1 = rearrange(img1, 'b c h w -> b (h w) c', h=h, w=w)
+        img2 = rearrange(img2, 'b c h w -> b (h w) c', h=h, w=w)
+        img1_sum = rearrange(img1_sum, 'b c h w -> b (h w) c', h=h, w=w)
+        img2_sum = rearrange(img2_sum, 'b c h w -> b (h w) c', h=h, w=w)
         for spa_layer, spe_layer in zip(self.spa_mamba_layers, self.spe_mamba_layers):
-            pan = spa_layer(pan)
-            ms = spe_layer(ms)
-        spa_fusion = self.spa_cross_mamba(pan, ms)
-        spe_fusion = self.spe_cross_mamba(ms, pan)
+            img1 = spa_layer(img1, img1_sum)
+            img2 = spe_layer(img2, img2_sum)
+        spa_fusion = self.spa_cross_mamba(img1, img2)
+        spe_fusion = self.spe_cross_mamba(img2, img1)
         fusion = self.out_proj((spa_fusion + spe_fusion) / 2)
-        pan = rearrange(pan, 'b (h w) c -> b c h w', h=h, w=w)
-        ms = rearrange(ms, 'b (h w) c -> b c h w', h=h, w=w)
+        img1 = rearrange(img1, 'b (h w) c -> b c h w', h=h, w=w)
+        img2 = rearrange(img2, 'b (h w) c -> b c h w', h=h, w=w)
         output = rearrange(fusion, 'b (h w) c -> b c h w', h=h, w=w)
         if self.final:
             return output
         else:
-            return (pan + output) / 2, (ms + output) /2
+            return (img1 + output) / 2, (img2 + output) /2
 
