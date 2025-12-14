@@ -1,5 +1,6 @@
 # hdr_load_train_data.py
 # FULL VERSION with FIXED cache hashing (stable sha1) so tiles are NOT reprocessed
+# + ability to disable persistent tile cache (on-the-fly extraction)
 
 import os
 import glob
@@ -94,14 +95,52 @@ def extract_tiles(img, tile_h, tile_w, stride_h=None, stride_w=None, pad_mode='r
     return tiles, coords, (H, W), (pad_top, pad_bottom, pad_left, pad_right)
 
 
+def _compute_coords_for_shape(H, W, tile_h, tile_w, stride_h, stride_w):
+    """Compute coords list and pad info for an image shape (H,W) without extracting tiles."""
+    stride_h = stride_h or tile_h
+    stride_w = stride_w or tile_w
+
+    if H <= tile_h:
+        pad_top, pad_bottom = 0, tile_h - H
+    else:
+        n_steps_h = math.ceil((H - tile_h) / float(stride_h)) + 1
+        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
+        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
+
+    if W <= tile_w:
+        pad_left, pad_right = 0, tile_w - W
+    else:
+        n_steps_w = math.ceil((W - tile_w) / float(stride_w)) + 1
+        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
+        pad_left, pad_right = 0, max(0, full_covered_w - W)
+
+    Hp = H + pad_top + pad_bottom
+    Wp = W + pad_left + pad_right
+
+    coords = []
+    for y in range(0, Hp - tile_h + 1, stride_h):
+        for x in range(0, Wp - tile_w + 1, stride_w):
+            y0 = max(0, y - pad_top)
+            x0 = max(0, x - pad_left)
+            y1 = min(H, y - pad_top + tile_h)
+            x1 = min(W, x - pad_left + tile_w)
+            coords.append((y0, y1, x0, x1))
+
+    return coords, (pad_top, pad_bottom, pad_left, pad_right)
+
+
 # -----------------------------
 # Dataset
 # -----------------------------
-
 class HDRDatasetTiles(data.Dataset):
     def __init__(self, data_dir, use_log=True, transform=None,
                  tile_h=None, tile_w=None, stride_h=None, stride_w=None,
-                 cache_dir=None, use_hdf5=True, use_worker_cache=False):
+                 cache_dir=None, use_hdf5=True, use_worker_cache=False,
+                 use_persistent_cache=True):
+        """
+        use_persistent_cache: if False, tiles will NOT be stored on disk.
+                              Tiles will be computed on-the-fly per __getitem__.
+        """
 
         self.data_dir = data_dir
         self.use_log = use_log
@@ -112,6 +151,7 @@ class HDRDatasetTiles(data.Dataset):
         self.stride_w = stride_w or tile_w
         self.use_hdf5 = use_hdf5
         self.use_worker_cache = use_worker_cache
+        self.use_persistent_cache = use_persistent_cache
 
         # scenes / pairs
         self.scenes = sorted(os.listdir(data_dir))
@@ -128,30 +168,48 @@ class HDRDatasetTiles(data.Dataset):
             if not hdr_files:
                 continue
             hdr = hdr_files[0]
-            
+
+            # guard if less than 3 ldr inputs (avoid index error)
+            if len(ldr_files) < 3:
+                # skip or use available combinations sensibly
+                continue
+
             self.pairs.append({
                 'ldr1': ldr_files[1],
                 'ldr2': ldr_files[0],
                 'hdr': hdr
             })
-            
-            self.pairs.append({
-                'ldr1': ldr_files[1],
-                'ldr2': ldr_files[2],
-                'hdr': hdr
-            })
+
+            # second pair (1,2)
+            if len(ldr_files) >= 3:
+                self.pairs.append({
+                    'ldr1': ldr_files[1],
+                    'ldr2': ldr_files[2],
+                    'hdr': hdr
+                })
 
         if not self.pairs:
             raise RuntimeError("No valid pairs found")
 
-        # cache paths
-        self.cache_dir = Path(cache_dir) if cache_dir else Path(data_dir) / "tile_cache"
-        self.cache_dir.mkdir(exist_ok=True)
-        self.metadata_file = self.cache_dir / "tile_metadata.pkl"
+        # cache paths (only create if using persistent cache)
+        self.cache_dir = None
+        if self.use_persistent_cache:
+            self.cache_dir = Path(cache_dir) if cache_dir else Path(data_dir) / "tile_cache"
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.metadata_file = self.cache_dir / "tile_metadata.pkl"
+        else:
+            self.metadata_file = None
 
         self.tiles_index = []
+        # pair_coords used when not using persistent cache
+        self.pair_coords = {}
+
         if self.tile_h is not None:
-            self._load_or_build_tile_cache()
+            if self.use_persistent_cache:
+                self._load_or_build_tile_cache()
+            else:
+                # build an in-memory index of coords per pair (no disk writes)
+                self._build_in_memory_index()
 
         self._summary_cache = OrderedDict() if use_worker_cache else None
 
@@ -167,10 +225,10 @@ class HDRDatasetTiles(data.Dataset):
         return m.hexdigest()
 
     def _get_hdf5_path(self):
-        return self.cache_dir / "tiles.h5"
+        return self.cache_dir / "tiles.h5" if self.cache_dir is not None else None
 
     def _get_tile_dir(self, pair_idx):
-        return self.cache_dir / f"pair_{pair_idx:06d}"
+        return self.cache_dir / f"pair_{pair_idx:06d}" if self.cache_dir is not None else None
 
     # -----------------------------
     # Cache handling
@@ -185,7 +243,8 @@ class HDRDatasetTiles(data.Dataset):
                 if meta.get('config_hash') == cfg_hash:
                     self.tiles_index = meta['tiles_index']
                     if self.use_hdf5:
-                        if self._get_hdf5_path().exists():
+                        h5_path = self._get_hdf5_path()
+                        if h5_path and h5_path.exists():
                             print(f"Loaded tile cache ({len(self.tiles_index)} tiles)")
                             return
                     else:
@@ -228,6 +287,22 @@ class HDRDatasetTiles(data.Dataset):
             pickle.dump(meta, f)
 
         print(f"Tile cache built: {len(self.tiles_index)} tiles")
+
+    def _build_in_memory_index(self):
+        """Create pair_coords and tiles_index without writing tiles to disk."""
+        self.tiles_index = []
+        self.pair_coords = {}
+        for pair_idx, pair in enumerate(self.pairs):
+            # read shape quickly (use hdr image as reference for shape)
+            img = cv2.imread(pair['hdr'], cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise RuntimeError(f"Failed to read image for pair {pair_idx}")
+            H, W = img.shape[0], img.shape[1]
+            coords, pad_info = _compute_coords_for_shape(H, W, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+            self.pair_coords[pair_idx] = (coords, (H, W))
+            for t in range(len(coords)):
+                self.tiles_index.append((pair_idx, t))
+        print(f"Built in-memory tile index: {len(self.tiles_index)} tiles (no persistent cache)")
 
     # -----------------------------
     # Extraction
@@ -296,7 +371,7 @@ class HDRDatasetTiles(data.Dataset):
         sum1, sum2 = self._compute_summary(t1, t2, tiles1, tiles2, coords, orig_shape)
 
         d = self._get_tile_dir(pair_idx)
-        d.mkdir(exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         for i in range(len(tiles_g)):
             torch.save({'gt': tiles_g[i], 'ldr1': tiles1[i], 'ldr2': tiles2[i], 'sum1': sum1, 'sum2': sum2}, d / f"tile_{i:04d}.pt")
         return len(tiles_g)
@@ -309,19 +384,49 @@ class HDRDatasetTiles(data.Dataset):
 
     def __getitem__(self, idx):
         pair_idx, tile_idx = self.tiles_index[idx]
-        if self.use_hdf5:
-            with h5py.File(self._get_hdf5_path(), 'r') as f:
-                g = f[f"pair_{pair_idx:06d}"]
-                return (
-                    torch.from_numpy(g['gt'][tile_idx]).float(),
-                    torch.from_numpy(g['ldr1'][tile_idx]).float(),
-                    torch.from_numpy(g['ldr2'][tile_idx]).float(),
-                    torch.from_numpy(g['sum1'][:]).float(),
-                    torch.from_numpy(g['sum2'][:]).float(),
-                )
+
+        # Persistent HDF5 / file-backed cache path (unchanged)
+        if self.use_persistent_cache:
+            if self.use_hdf5:
+                with h5py.File(self._get_hdf5_path(), 'r') as f:
+                    g = f[f"pair_{pair_idx:06d}"]
+                    return (
+                        torch.from_numpy(g['gt'][tile_idx]).float(),
+                        torch.from_numpy(g['ldr1'][tile_idx]).float(),
+                        torch.from_numpy(g['ldr2'][tile_idx]).float(),
+                        torch.from_numpy(g['sum1'][:]).float(),
+                        torch.from_numpy(g['sum2'][:]).float(),
+                    )
+            else:
+                d = torch.load(self._get_tile_dir(pair_idx) / f"tile_{tile_idx:04d}.pt")
+                return d['gt'], d['ldr1'], d['ldr2'], d['sum1'], d['sum2']
+
+        # On-the-fly extraction path (no persistent cache)
+        # We compute tiles for the requested pair and return the requested tile.
+        pair = self.pairs[pair_idx]
+        # optionally reuse computed summary for this worker/pair
+        if self._summary_cache is not None and pair_idx in self._summary_cache:
+            sum1, sum2 = self._summary_cache[pair_idx]
         else:
-            d = torch.load(self._get_tile_dir(pair_idx) / f"tile_{tile_idx:04d}.pt")
-            return d['gt'], d['ldr1'], d['ldr2'], d['sum1'], d['sum2']
+            # load images and extract tiles (we keep tiles lists in local scope only)
+            tg, t1, t2 = self._load_images(pair)
+            tiles_g, coords, orig_shape, _ = extract_tiles(tg, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+            tiles1, _, _, _ = extract_tiles(t1, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+            tiles2, _, _, _ = extract_tiles(t2, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+            sum1, sum2 = self._compute_summary(t1, t2, tiles1, tiles2, coords, orig_shape)
+            if self._summary_cache is not None:
+                # keep small cache keyed by pair index
+                self._summary_cache[pair_idx] = (sum1, sum2)
+
+            return tiles_g[tile_idx], tiles1[tile_idx], tiles2[tile_idx], sum1, sum2
+
+        # if summary came from cache we still need the specific tile: load images and crop the tile
+        tg, t1, t2 = self._load_images(pair)
+        tiles_g, coords, orig_shape, _ = extract_tiles(tg, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+        tiles1, _, _, _ = extract_tiles(t1, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+        tiles2, _, _, _ = extract_tiles(t2, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+        sum1, sum2 = self._summary_cache[pair_idx]
+        return tiles_g[tile_idx], tiles1[tile_idx], tiles2[tile_idx], sum1, sum2
 
 
 if __name__ == "__main__":
@@ -335,16 +440,24 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--no_persistent_cache", action="store_true",
+                        help="Disable persistent disk cache; extract tiles on-the-fly (slower).")
     args = parser.parse_args()
 
+    use_persistent_cache = not args.no_persistent_cache
+
     if args.preprocess:
-        preprocess_dataset(
+        # Instantiate dataset with persistent cache enabled to build the cache
+        ds = HDRDatasetTiles(
             args.data_dir,
             tile_h=256, tile_w=256,
             stride_h=192, stride_w=192,
             cache_dir=args.cache_dir,
-            use_hdf5=args.use_hdf5
+            use_hdf5=args.use_hdf5,
+            use_worker_cache=False,
+            use_persistent_cache=use_persistent_cache
         )
+        print("Preprocessing complete (cache built or in-memory index created).")
     else:
         # Normal training usage
         ds = HDRDatasetTiles(
@@ -353,12 +466,13 @@ if __name__ == "__main__":
             stride_h=192, stride_w=192,
             cache_dir=args.cache_dir,
             use_hdf5=args.use_hdf5,
-            use_worker_cache=False  # Disable worker cache to save memory
+            use_worker_cache=False,  # Disable worker cache to save memory
+            use_persistent_cache=use_persistent_cache
         )
-        
+
         print(f"Dataset length: {len(ds)} tiles")
         print(f"Creating DataLoader with {args.num_workers} workers...")
-        
+
         loader = DataLoader(
             ds,
             batch_size=args.batch_size,
@@ -368,12 +482,12 @@ if __name__ == "__main__":
             persistent_workers=True if args.num_workers > 0 else False,
             prefetch_factor=2 if args.num_workers > 0 else None
         )
-        
+
         print("Testing DataLoader...")
         for i, (gt, l1, l2, s1, s2) in enumerate(loader):
             print(f"Batch {i}: gt={gt.shape}, ldr1={l1.shape}, ldr2={l2.shape}, "
                   f"sum1={s1.shape}, sum2={s2.shape}")
             if i >= 2:
                 break
-        
+
         print("Success! No memory issues.")
