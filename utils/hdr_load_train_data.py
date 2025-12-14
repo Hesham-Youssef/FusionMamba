@@ -1,9 +1,12 @@
 # hdr_load_train_data.py
 # Simplified version with on-the-fly tile extraction only
+# + support for a split CSV (columns: scene, split)
 
 import os
 import glob
 import math
+import csv
+from pathlib import Path
 
 import numpy as np
 import cv2
@@ -132,7 +135,7 @@ class HDRDatasetTiles(data.Dataset):
                  split=None, split_scenes=None):
         """
         split: 'train', 'val', or None
-        split_scenes: list of scene names to include in this split (optional)
+        split_scenes: list or set of scene names to include in this split (optional)
         """
 
         self.data_dir = data_dir
@@ -166,9 +169,9 @@ class HDRDatasetTiles(data.Dataset):
                 continue
             hdr = hdr_files[0]
             # create pairs
+            # note: keep same pairing logic as before
             self.pairs.append({'ldr1': ldr_files[1], 'ldr2': ldr_files[0], 'hdr': hdr})
-            if len(ldr_files) >= 3:
-                self.pairs.append({'ldr1': ldr_files[1], 'ldr2': ldr_files[2], 'hdr': hdr})
+            self.pairs.append({'ldr1': ldr_files[1], 'ldr2': ldr_files[2], 'hdr': hdr})
 
         if not self.pairs:
             raise RuntimeError(f"No valid pairs found for split={split}")
@@ -250,21 +253,80 @@ class HDRDatasetTiles(data.Dataset):
         return tiles_g[tile_idx], tiles1[tile_idx], tiles2[tile_idx], sum1, sum2
 
 
+# -----------------------------
+# CSV split helper
+# -----------------------------
+def read_split_csv(csv_path, split_name):
+    """
+    Read a CSV with columns 'scene' and 'split' and return a set of scenes matching split_name.
+    split_name: e.g. 'train' or 'val'
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Split CSV not found: {csv_path}")
+
+    scenes = set()
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter=',', skipinitialspace=True)
+        # support TSV-like or Excel-exported files: accept either delimiter tab or comma
+        # if headers appear to be tab-separated, try tab
+        if 'scene' not in reader.fieldnames or 'split' not in reader.fieldnames:
+            # try tab delimiter
+            f.seek(0)
+            reader = csv.DictReader(f, delimiter='\t', skipinitialspace=True)
+            if 'scene' not in reader.fieldnames or 'split' not in reader.fieldnames:
+                raise RuntimeError("CSV must contain 'scene' and 'split' columns (tab or comma separated).")
+        for row in reader:
+            scene = row.get('scene')
+            sp = row.get('split')
+            if scene is None or sp is None:
+                continue
+            scene = scene.strip()
+            sp = sp.strip()
+            if sp == split_name:
+                scenes.add(scene)
+    return scenes
+
+
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True)
+    parser.add_argument("--split_csv", default=None,
+                        help="Path to CSV file with columns 'scene' and 'split'. Example: scene\\tsplit")
+    parser.add_argument("--split", choices=['train', 'val', 'all'], default='all',
+                        help="Which split to load (requires --split_csv). 'all' loads all scenes.")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--tile_h", type=int, default=256)
+    parser.add_argument("--tile_w", type=int, default=256)
+    parser.add_argument("--stride_h", type=int, default=192)
+    parser.add_argument("--stride_w", type=int, default=192)
     args = parser.parse_args()
+
+    split_scenes = None
+    if args.split_csv is not None and args.split != 'all':
+        split_scenes = read_split_csv(args.split_csv, args.split)
+        # warn about scenes listed in CSV but not present in data_dir
+        available = set(p.name for p in Path(args.data_dir).iterdir() if p.is_dir())
+        missing = split_scenes - available
+        if missing:
+            print(f"Warning: {len(missing)} scenes listed in CSV (split={args.split}) were not found in {args.data_dir}:")
+            for m in sorted(missing)[:20]:
+                print("  -", m)
+            # silently ignore missing scenes; dataset will include the intersection
+        split_scenes = sorted(list(split_scenes & available))
+        print(f"Using {len(split_scenes)} scenes for split='{args.split}'")
 
     # Create dataset with on-the-fly tile extraction
     ds = HDRDatasetTiles(
         args.data_dir,
-        tile_h=256, tile_w=256,
-        stride_h=192, stride_w=192
+        tile_h=args.tile_h, tile_w=args.tile_w,
+        stride_h=args.stride_h, stride_w=args.stride_w,
+        split=args.split if args.split != 'all' else None,
+        split_scenes=split_scenes
     )
 
     print(f"Dataset length: {len(ds)} tiles")
