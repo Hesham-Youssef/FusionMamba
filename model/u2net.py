@@ -154,15 +154,17 @@ class U2Net(nn.Module):
         self.img2_spe_attn = SpeAttention(dim)
         
         
+        skip_in_channels = img1_dim + img2_dim
+        skip_mid = max(1, dim // 2)
+
         self.skip_gate = nn.Sequential(
-            nn.Conv2d(6, 32, 3, 1, 1),
+            nn.Conv2d(skip_in_channels, dim, 3, 1, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 16, 3, 1, 1),
+            nn.Conv2d(dim, skip_mid, 3, 1, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 1),
+            nn.Conv2d(skip_mid, 1, 1),
             nn.Sigmoid()
         )
-        
         self.skip_alpha_param = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, img1, img2, sum1, sum2):

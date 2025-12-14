@@ -213,6 +213,11 @@ def train(args, training_data_loader, validate_data_loader):
         args.W,
         args.ratio
     ).to(args.device)
+    
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
 
     # Model expects all inputs to be the same size (tile_h x tile_w)
     # The ratio parameter is used internally by the model for processing
