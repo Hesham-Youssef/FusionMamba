@@ -152,6 +152,18 @@ class U2Net(nn.Module):
 
         self.img1_spe_attn = SpeAttention(dim)
         self.img2_spe_attn = SpeAttention(dim)
+        
+        
+        self.skip_gate = nn.Sequential(
+            nn.Conv2d(6, 32, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        self.skip_alpha_param = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, img1, img2, sum1, sum2):
         org_img1 = img1
@@ -174,5 +186,17 @@ class U2Net(nn.Module):
         img1_spe_attn = self.img1_spe_attn(org_img1)
         img2_spe_attn = self.img2_spe_attn(org_img2)
 
-        output = self.to_hrimg2(output) * (img1_spe_attn + img2_spe_attn)
+        # decoder → RGB
+        output = self.to_hrimg2(output)
+
+        # spectral attention
+        output = output * (img1_spe_attn + img2_spe_attn)
+
+        gate_in = torch.cat([org_img1, output], dim=1)   # (B, 6, H, W)
+        gate = self.skip_gate(gate_in)                    # (B, 1, H, W)
+
+        skip_alpha = torch.sigmoid(self.skip_alpha_param)
+        
+        output = output + skip_alpha * gate * (org_img1 - output)
+
         return output

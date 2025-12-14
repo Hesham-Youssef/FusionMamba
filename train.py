@@ -83,9 +83,7 @@ def prepare_training_data(args):
         tile_w=tile_w,
         stride_h=stride_h,
         stride_w=stride_w,
-        use_log=True,
-        transform=None,  # or your custom transform
-        precompute_tiles_index=False  # speeds up indexing
+        use_worker_cache=False
     )
 
     # Validation dataset (tiles, or full images if you prefer)
@@ -95,15 +93,15 @@ def prepare_training_data(args):
         tile_w=tile_w,
         stride_h=stride_h,
         stride_w=stride_w,
-        use_log=True,
-        transform=None,
-        precompute_tiles_index=False
+        use_worker_cache=False
     )
 
     training_data_loader = DataLoader(dataset=train_set, num_workers=4, batch_size=args.batch_size,
-                                      shuffle=True, pin_memory=False, drop_last=False)
+                                      shuffle=True, pin_memory=False, drop_last=False,
+                                      persistent_workers=True, prefetch_factor=1)
     validate_data_loader = DataLoader(dataset=validate_set, num_workers=4 , batch_size=args.batch_size,
-                                      shuffle=False, pin_memory=False, drop_last=False)
+                                      shuffle=False, pin_memory=False, drop_last=False,
+                                      persistent_workers=True, prefetch_factor=1)
     return training_data_loader, validate_data_loader
 
 
@@ -128,17 +126,20 @@ def train(args, training_data_loader, validate_data_loader):
         criterion1 = ERGAS(args.ratio).to(args.device)
     else:
         criterion = nn.L1Loss().to(args.device)
+
+    
+    start_epoch = 1
+    end_epoch = args.epoch + start_epoch - 1
+    num_epochs_to_run = end_epoch - start_epoch + 1
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,           # your peak LR
-        total_steps=len(training_data_loader),  # total iterations (batches)
+        total_steps=len(training_data_loader) * num_epochs_to_run,  # total iterations (batches)
         pct_start=0.3,            # fraction of iterations to increase LR
         anneal_strategy='cos'  # linear or cosine
     )
-
-    start_epoch = 1
-
+    
     if args.resume_path is not None and os.path.isfile(args.resume_path):
         print(f"Loading checkpoint: {args.resume_path}")
         checkpoint = torch.load(args.resume_path, map_location=args.device)
@@ -153,19 +154,18 @@ def train(args, training_data_loader, validate_data_loader):
     
     t_start = time.time()
     print('Start training...')
-    end_epoch = args.epoch + start_epoch - 1
+    
     # train
     for epoch in range(start_epoch, end_epoch, 1):
-        epoch += 1
         model.train()
         epoch_train_loss = []
         epoch_train_loss0 = []
         epoch_train_loss1 = []
         for iteration, batch in enumerate(training_data_loader, 1):
-            gt, ldr_short, ldr_long, sum_short, sum_long = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device), batch[3].to(args.device), batch[4].to(args.device) 
+            gt, ldr1, ldr2, sum1, sum2 = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device), batch[3].to(args.device), batch[4].to(args.device) 
             
             optimizer.zero_grad()
-            sr = model(ldr_short, ldr_long, sum_short, sum_long)
+            sr = model(ldr1, ldr2, sum1, sum2)
             
             # -------------------------------------------------------
             # Save first batch of first epoch for debugging (GT, inputs, SR)
@@ -198,14 +198,14 @@ def train(args, training_data_loader, validate_data_loader):
 
         # validate
         with torch.no_grad():
-            if epoch % 10 == 0:
+            if epoch % 1 == 0:
                 model.eval()
                 epoch_val_loss = []
                 epoch_val_loss0 = []
                 epoch_val_loss1 = []
                 for iteration, batch in enumerate(validate_data_loader, 1):
-                    gt, ldr_short, ldr_long, sum_short, sum_long = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device), batch[3].to(args.device), batch[4].to(args.device)
-                    sr = model(ldr_short, ldr_long, sum_short, sum_long)
+                    gt, ldr1, ldr2, sum1, sum2 = batch[0].to(args.device), batch[1].to(args.device), batch[2].to(args.device), batch[3].to(args.device), batch[4].to(args.device)
+                    sr = model(ldr1, ldr2, sum1, sum2)
                     if args.use_ergas is True:
                         loss0 = criterion0(sr, gt)
                         loss1 = criterion1(sr, gt)
@@ -243,8 +243,8 @@ if __name__ == "__main__":
     parser.add_argument('--ratio', type=int, default=1, help='Upsample ratio')
     parser.add_argument('--H', type=int, default=64, help='Height of the high-resolution image')
     parser.add_argument('--W', type=int, default=64, help='Width of the high-resolution image')
-    parser.add_argument('--stride_H', type=int, default=16, help='Width of the high-resolution image')
-    parser.add_argument('--stride_W', type=int, default=16, help='Width of the high-resolution image')
+    parser.add_argument('--stride_H', type=int, default=32, help='Width of the high-resolution image')
+    parser.add_argument('--stride_W', type=int, default=32, help='Width of the high-resolution image')
     parser.add_argument('--channels', type=int, default=32, help='Feature channels')
     parser.add_argument('--first_channels', type=int, default=3, help='Spatial channels')
     parser.add_argument('--second_channels', type=int, default=3, help='Spectral channels')
