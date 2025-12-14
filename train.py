@@ -1,15 +1,20 @@
 import os
 import time
-import torch
+import csv
+from pathlib import Path
 import argparse
+
+import torch
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-from utils.tools import ERGAS
-from torchinfo import summary
 import torch.backends.cudnn as cudnn
-from model.u2net import U2Net as Net
+
+from torchinfo import summary
 from torch.utils.data import DataLoader
+
+from utils.tools import ERGAS
+from model.u2net import U2Net as Net
 from utils.hdr_load_train_data import HDRDatasetTiles
 import cv2
 
@@ -54,8 +59,47 @@ def save_checkpoint(args, model, optimizer, scheduler, epoch):
     print(f"Checkpoint saved: {save_path}")
 
 
+# -----------------------------
+# CSV split helper
+# -----------------------------
+def read_split_csv(csv_path):
+    """
+    Read a CSV/TSV with columns 'scene' and 'split' and return a dict mapping split -> set(scenes).
+    Accepts comma or tab delimiters.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Split CSV not found: {csv_path}")
+
+    # try comma first, then tab
+    for delimiter in [',', '\t']:
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
+            if reader.fieldnames and 'scene' in reader.fieldnames and 'split' in reader.fieldnames:
+                splits = {}
+                f.seek(0)
+                reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
+                for row in reader:
+                    scene = row.get('scene')
+                    sp = row.get('split')
+                    if scene is None or sp is None:
+                        continue
+                    scene = scene.strip()
+                    sp = sp.strip()
+                    splits.setdefault(sp, set()).add(scene)
+                return splits
+    raise RuntimeError("CSV must contain 'scene' and 'split' columns (tab or comma separated).")
+
+
+# -----------------------------
+# Prepare data loaders
+# -----------------------------
 def prepare_training_data(args):
-    """Prepare training and validation data loaders."""
+    """Prepare training and validation data loaders.
+    Supports two modes:
+    1) CSV split mode: pass --split_csv and --data_dir, script reads CSV and filters scenes.
+    2) Classic mode: pass --train_data_path and --val_data_path (backwards compatible).
+    """
     # Use tile dimensions from args (H and W are the tile dimensions)
     tile_h = args.H
     tile_w = args.W
@@ -66,23 +110,68 @@ def prepare_training_data(args):
     print(f"  Tile size: {tile_h}x{tile_w}")
     print(f"  Stride: {stride_h}x{stride_w}")
 
-    # Training dataset
-    train_set = HDRDatasetTiles(
-        data_dir=args.train_data_path,
-        tile_h=tile_h,
-        tile_w=tile_w,
-        stride_h=stride_h,
-        stride_w=stride_w
-    )
+    # If user provided a split CSV, use it
+    if args.split_csv:
+        if not args.data_dir:
+            # fallback to train_data_path if provided
+            if args.train_data_path:
+                data_dir = args.train_data_path
+            elif args.val_data_path:
+                data_dir = args.val_data_path
+            else:
+                raise ValueError("When using --split_csv you must provide --data_dir or --train_data_path/--val_data_path")
+        else:
+            data_dir = args.data_dir
 
-    # Validation dataset
-    validate_set = HDRDatasetTiles(
-        data_dir=args.val_data_path,
-        tile_h=tile_h,
-        tile_w=tile_w,
-        stride_h=stride_h,
-        stride_w=stride_w
-    )
+        print(f"Reading split CSV: {args.split_csv}")
+        splits = read_split_csv(args.split_csv)
+        train_scenes = splits.get('train', set())
+        val_scenes = splits.get('val', set())
+
+        available = set(p.name for p in Path(data_dir).iterdir() if p.is_dir())
+        missing_train = train_scenes - available
+        missing_val = val_scenes - available
+        if missing_train:
+            print(f"Warning: {len(missing_train)} train scenes from CSV not found in {data_dir}. They will be ignored.")
+        if missing_val:
+            print(f"Warning: {len(missing_val)} val scenes from CSV not found in {data_dir}. They will be ignored.")
+
+        train_scenes = sorted(list(train_scenes & available))
+        val_scenes = sorted(list(val_scenes & available))
+
+        print(f"Using {len(train_scenes)} scenes for training, {len(val_scenes)} for validation (from CSV).")
+
+        train_set = HDRDatasetTiles(
+            data_dir=data_dir,
+            tile_h=tile_h, tile_w=tile_w,
+            stride_h=stride_h, stride_w=stride_w,
+            split='train',
+            split_scenes=train_scenes
+        )
+
+        validate_set = HDRDatasetTiles(
+            data_dir=data_dir,
+            tile_h=tile_h, tile_w=tile_w,
+            stride_h=stride_h, stride_w=stride_w,
+            split='val',
+            split_scenes=val_scenes
+        )
+
+    else:
+        # Classic mode (backward compatible)
+        if not args.train_data_path or not args.val_data_path:
+            raise ValueError("train_data_path and val_data_path must be provided when not using --split_csv")
+        train_set = HDRDatasetTiles(
+            data_dir=args.train_data_path,
+            tile_h=tile_h, tile_w=tile_w,
+            stride_h=stride_h, stride_w=stride_w
+        )
+
+        validate_set = HDRDatasetTiles(
+            data_dir=args.val_data_path,
+            tile_h=tile_h, tile_w=tile_w,
+            stride_h=stride_h, stride_w=stride_w
+        )
 
     print(f"Training tiles: {len(train_set)}")
     print(f"Validation tiles: {len(validate_set)}")
@@ -98,7 +187,7 @@ def prepare_training_data(args):
         persistent_workers=True if args.num_workers > 0 else False,
         prefetch_factor=2 if args.num_workers > 0 else None
     )
-    
+
     validate_data_loader = DataLoader(
         dataset=validate_set,
         num_workers=args.num_workers,
@@ -109,7 +198,7 @@ def prepare_training_data(args):
         persistent_workers=True if args.num_workers > 0 else False,
         prefetch_factor=2 if args.num_workers > 0 else None
     )
-    
+
     return training_data_loader, validate_data_loader
 
 
@@ -124,7 +213,7 @@ def train(args, training_data_loader, validate_data_loader):
         args.W,
         args.ratio
     ).to(args.device)
-    
+
     # Model expects all inputs to be the same size (tile_h x tile_w)
     # The ratio parameter is used internally by the model for processing
     print("\nModel Architecture:")
@@ -150,7 +239,7 @@ def train(args, training_data_loader, validate_data_loader):
     start_epoch = 1
     end_epoch = args.epoch
     num_epochs_to_run = end_epoch - start_epoch + 1
-    
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -159,7 +248,7 @@ def train(args, training_data_loader, validate_data_loader):
         pct_start=0.3,
         anneal_strategy='cos'
     )
-    
+
     # Resume from checkpoint if provided
     if args.resume_path is not None and os.path.isfile(args.resume_path):
         print(f"\nLoading checkpoint: {args.resume_path}")
@@ -175,16 +264,16 @@ def train(args, training_data_loader, validate_data_loader):
 
     print(f"\nTraining from epoch {start_epoch} to {end_epoch}")
     print("=" * 80)
-    
+
     t_start = time.time()
-    
+
     # Training loop
     for epoch in range(start_epoch, end_epoch + 1):
         model.train()
         epoch_train_loss = []
         epoch_train_loss_l1 = []
         epoch_train_loss_ergas = []
-        
+
         for iteration, batch in enumerate(training_data_loader, 1):
             gt, ldr1, ldr2, sum1, sum2 = (
                 batch[0].to(args.device),
@@ -193,10 +282,10 @@ def train(args, training_data_loader, validate_data_loader):
                 batch[3].to(args.device),
                 batch[4].to(args.device)
             )
-            
+
             optimizer.zero_grad()
             sr = model(ldr1, ldr2, sum1, sum2)
-            
+
             # Optional: Save first batch of first epoch for debugging
             if args.save_debug and epoch == start_epoch and iteration == 1:
                 save_batch_debug(gt, ldr1, ldr2, sr, epoch, iteration)
@@ -210,21 +299,21 @@ def train(args, training_data_loader, validate_data_loader):
                 epoch_train_loss_ergas.append(loss_ergas.item())
             else:
                 loss = criterion(sr, gt)
-            
+
             epoch_train_loss.append(loss.item())
-            
+
             # Backward pass
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
-            
+
             # Print progress
             if iteration % args.print_freq == 0:
                 print(f'Epoch: {epoch}/{end_epoch} | '
                       f'Iter: {iteration}/{len(training_data_loader)} | '
                       f'Loss: {loss.item():.6f} | '
                       f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
-        
+
         # Epoch summary
         t_loss = np.nanmean(np.array(epoch_train_loss))
         if args.use_ergas:
@@ -241,7 +330,7 @@ def train(args, training_data_loader, validate_data_loader):
             epoch_val_loss = []
             epoch_val_loss_l1 = []
             epoch_val_loss_ergas = []
-            
+
             with torch.no_grad():
                 for iteration, batch in enumerate(validate_data_loader, 1):
                     gt, ldr1, ldr2, sum1, sum2 = (
@@ -251,9 +340,9 @@ def train(args, training_data_loader, validate_data_loader):
                         batch[3].to(args.device),
                         batch[4].to(args.device)
                     )
-                    
+
                     sr = model(ldr1, ldr2, sum1, sum2)
-                    
+
                     if args.use_ergas:
                         loss_l1 = criterion_l1(sr, gt)
                         loss_ergas = criterion_ergas(sr, gt)
@@ -262,12 +351,12 @@ def train(args, training_data_loader, validate_data_loader):
                         epoch_val_loss_ergas.append(loss_ergas.item())
                     else:
                         loss = criterion(sr, gt)
-                    
+
                     epoch_val_loss.append(loss.item())
-            
+
             v_loss = np.nanmean(np.array(epoch_val_loss))
             t_end = time.time()
-            
+
             print(f'\n{"="*80}')
             print(f'Validation Results:')
             if args.use_ergas:
@@ -278,13 +367,13 @@ def train(args, training_data_loader, validate_data_loader):
                 print(f'  Loss: {v_loss:.6f}')
             print(f'Time elapsed: {(t_end - t_start):.2f}s')
             print(f'{"="*80}\n')
-            
+
             t_start = time.time()
 
         # Save checkpoint
         if epoch % args.ckpt == 0:
             save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
-    
+
     # Save final checkpoint
     save_checkpoint(args, model, optimizer, lr_scheduler, end_epoch)
     print("\nTraining completed!")
@@ -292,65 +381,69 @@ def train(args, training_data_loader, validate_data_loader):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='HDR Image Reconstruction Training')
-    
+
     # Model architecture
-    parser.add_argument('--ratio', type=int, default=1, 
+    parser.add_argument('--ratio', type=int, default=1,
                         help='Internal processing ratio used by model')
-    parser.add_argument('--H', type=int, default=64, 
+    parser.add_argument('--H', type=int, default=64,
                         help='Tile height')
-    parser.add_argument('--W', type=int, default=64, 
+    parser.add_argument('--W', type=int, default=64,
                         help='Tile width')
-    parser.add_argument('--stride_H', type=int, default=32, 
+    parser.add_argument('--stride_H', type=int, default=32,
                         help='Vertical stride for tile extraction')
-    parser.add_argument('--stride_W', type=int, default=32, 
+    parser.add_argument('--stride_W', type=int, default=32,
                         help='Horizontal stride for tile extraction')
-    parser.add_argument('--channels', type=int, default=32, 
+    parser.add_argument('--channels', type=int, default=32,
                         help='Number of feature channels')
-    parser.add_argument('--first_channels', type=int, default=3, 
+    parser.add_argument('--first_channels', type=int, default=3,
                         help='Number of spatial channels')
-    parser.add_argument('--second_channels', type=int, default=3, 
+    parser.add_argument('--second_channels', type=int, default=3,
                         help='Number of spectral channels')
-    
+
     # Loss function
-    parser.add_argument('--use_ergas', action='store_true', 
+    parser.add_argument('--use_ergas', action='store_true',
                         help='Use ERGAS loss in addition to L1 loss')
-    parser.add_argument('--ergas_hp', type=float, default=1e-4, 
+    parser.add_argument('--ergas_hp', type=float, default=1e-4,
                         help='Weight for ERGAS loss')
-    
+
     # Training parameters
-    parser.add_argument('--epoch', type=int, default=500, 
+    parser.add_argument('--epoch', type=int, default=500,
                         help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=20, 
+    parser.add_argument('--batch_size', type=int, default=20,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=5e-4, 
+    parser.add_argument('--lr', type=float, default=5e-4,
                         help='Initial learning rate')
-    parser.add_argument('--num_workers', type=int, default=4, 
+    parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loader workers')
-    
+
     # Checkpointing and validation
-    parser.add_argument('--ckpt', type=int, default=20, 
+    parser.add_argument('--ckpt', type=int, default=20,
                         help='Save checkpoint every N epochs')
-    parser.add_argument('--val_freq', type=int, default=1, 
+    parser.add_argument('--val_freq', type=int, default=1,
                         help='Run validation every N epochs')
-    parser.add_argument('--print_freq', type=int, default=10, 
+    parser.add_argument('--print_freq', type=int, default=10,
                         help='Print training stats every N iterations')
-    parser.add_argument('--save_debug', action='store_true', 
+    parser.add_argument('--save_debug', action='store_true',
                         help='Save debug images from first batch')
-    
+
     # Paths
-    parser.add_argument('--device', type=str, default='cuda', 
+    parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu'])
-    parser.add_argument('--train_data_path', type=str, required=True,
-                        help='Path to training dataset')
-    parser.add_argument('--val_data_path', type=str, required=True,
-                        help='Path to validation dataset')
-    parser.add_argument('--weight_dir', type=str, default='weights/', 
+    parser.add_argument('--train_data_path', type=str, default=None,
+                        help='Path to training dataset (use when not using --split_csv)')
+    parser.add_argument('--val_data_path', type=str, default=None,
+                        help='Path to validation dataset (use when not using --split_csv)')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Path to full dataset (use with --split_csv)')
+    parser.add_argument('--split_csv', type=str, default=None,
+                        help="Path to CSV/TSV file with columns 'scene' and 'split' (use with --data_dir)")
+    parser.add_argument('--weight_dir', type=str, default='weights/',
                         help='Directory to save checkpoints')
-    parser.add_argument('--resume_path', type=str, default=None, 
+    parser.add_argument('--resume_path', type=str, default=None,
                         help='Path to checkpoint to resume from')
-    
+
     args = parser.parse_args()
-    
+
     # Validate arguments
     if args.H <= 0 or args.W <= 0:
         raise ValueError("Tile dimensions (H, W) must be positive")
@@ -358,7 +451,7 @@ if __name__ == "__main__":
         raise ValueError("Stride dimensions must be positive")
     if args.stride_H > args.H or args.stride_W > args.W:
         print("Warning: Stride larger than tile size will create gaps in coverage")
-    
+
     print("\nTraining Configuration:")
     print(f"  Device: {args.device}")
     print(f"  Tile size: {args.H}x{args.W}")
