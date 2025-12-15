@@ -217,9 +217,9 @@ def prepare_training_data(args):
             dataset=train_set,
             batch_sampler=train_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True if args.num_workers > 0 else False,
-            prefetch_factor=2 if args.num_workers > 0 else None
+            prefetch_factor=1 if args.num_workers > 0 else None
         )
         
         # Validation typically doesn't need smart sampler but we can use it
@@ -228,9 +228,9 @@ def prepare_training_data(args):
             dataset=validate_set,
             batch_sampler=val_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True if args.num_workers > 0 else False,
-            prefetch_factor=2 if args.num_workers > 0 else None
+            prefetch_factor=1 if args.num_workers > 0 else None
         )
     else:
         # Standard DataLoader
@@ -239,10 +239,10 @@ def prepare_training_data(args):
             num_workers=args.num_workers,
             batch_size=args.batch_size,
             shuffle=True,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             persistent_workers=True if args.num_workers > 0 else False,
-            prefetch_factor=2 if args.num_workers > 0 else None
+            prefetch_factor=1 if args.num_workers > 0 else None
         )
 
         validate_data_loader = DataLoader(
@@ -250,10 +250,10 @@ def prepare_training_data(args):
             num_workers=args.num_workers,
             batch_size=args.batch_size,
             shuffle=False,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=False,
             persistent_workers=True if args.num_workers > 0 else False,
-            prefetch_factor=2 if args.num_workers > 0 else None
+            prefetch_factor=1 if args.num_workers > 0 else None
         )
 
     return training_data_loader, validate_data_loader, train_set, validate_set
