@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from utils.tools import ERGAS
 from model.u2net import U2Net as Net
-from utils.hdr_load_train_data import HDRDatasetTiles
+from utils.hdr_load_train_data import HDRDatasetMaxPerf
 import cv2
 
 SEED = 1
@@ -95,7 +95,7 @@ def read_split_csv(csv_path):
 # Prepare data loaders
 # -----------------------------
 def prepare_training_data(args):
-    """Prepare training and validation data loaders.
+    """Prepare training and validation data loaders with optimized features.
     Supports two modes:
     1) CSV split mode: pass --split_csv and --data_dir, script reads CSV and filters scenes.
     2) Classic mode: pass --train_data_path and --val_data_path (backwards compatible).
@@ -106,9 +106,19 @@ def prepare_training_data(args):
     stride_h = args.stride_H
     stride_w = args.stride_W
 
-    print(f"Dataset configuration:")
+    print(f"\n{'='*80}")
+    print("Dataset Configuration:")
     print(f"  Tile size: {tile_h}x{tile_w}")
     print(f"  Stride: {stride_h}x{stride_w}")
+    print(f"\nOptimization Features:")
+    print(f"  Half precision (fp16): {args.use_half}")
+    print(f"  Parallel load threads: {args.num_load_threads}")
+    print(f"  Disk cache: {args.use_disk_cache}")
+    if args.use_disk_cache:
+        print(f"  Disk cache dir: {args.disk_cache_dir}")
+    print(f"  Max cached pairs: {args.max_cached_pairs}")
+    print(f"  Smart sampler: {args.use_smart_sampler}")
+    print(f"{'='*80}\n")
 
     # If user provided a split CSV, use it
     if args.split_csv:
@@ -141,68 +151,113 @@ def prepare_training_data(args):
 
         print(f"Using {len(train_scenes)} scenes for training, {len(val_scenes)} for validation (from CSV).")
 
-        train_set = HDRDatasetTiles(
+        train_set = HDRDatasetMaxPerf(
             data_dir=data_dir,
             tile_h=tile_h, tile_w=tile_w,
             stride_h=stride_h, stride_w=stride_w,
             split='train',
-            split_scenes=train_scenes
+            split_scenes=train_scenes,
+            max_cached_pairs=args.max_cached_pairs,
+            use_half=args.use_half,
+            num_load_threads=args.num_load_threads,
+            use_disk_cache=args.use_disk_cache,
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
         )
 
-        validate_set = HDRDatasetTiles(
+        validate_set = HDRDatasetMaxPerf(
             data_dir=data_dir,
             tile_h=tile_h, tile_w=tile_w,
             stride_h=stride_h, stride_w=stride_w,
             split='val',
-            split_scenes=val_scenes
+            split_scenes=val_scenes,
+            max_cached_pairs=args.max_cached_pairs,
+            use_half=args.use_half,
+            num_load_threads=args.num_load_threads,
+            use_disk_cache=args.use_disk_cache,
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
         )
 
     else:
         # Classic mode (backward compatible)
         if not args.train_data_path or not args.val_data_path:
             raise ValueError("train_data_path and val_data_path must be provided when not using --split_csv")
-        train_set = HDRDatasetTiles(
+        
+        train_set = HDRDatasetMaxPerf(
             data_dir=args.train_data_path,
             tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w
+            stride_h=stride_h, stride_w=stride_w,
+            max_cached_pairs=args.max_cached_pairs,
+            use_half=args.use_half,
+            num_load_threads=args.num_load_threads,
+            use_disk_cache=args.use_disk_cache,
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
         )
 
-        validate_set = HDRDatasetTiles(
+        validate_set = HDRDatasetMaxPerf(
             data_dir=args.val_data_path,
             tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w
+            stride_h=stride_h, stride_w=stride_w,
+            max_cached_pairs=args.max_cached_pairs,
+            use_half=args.use_half,
+            num_load_threads=args.num_load_threads,
+            use_disk_cache=args.use_disk_cache,
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
         )
 
     print(f"Training tiles: {len(train_set)}")
     print(f"Validation tiles: {len(validate_set)}")
 
-    # DataLoader settings optimized for GPU training
-    training_data_loader = DataLoader(
-        dataset=train_set,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,  # Enable for faster GPU transfer
-        drop_last=True,   # Drop last incomplete batch for consistent batch sizes
-        persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=2 if args.num_workers > 0 else None
-    )
+    # Create data loaders with optional smart sampler
+    if args.use_smart_sampler:
+        print("Using smart sampler for better cache locality")
+        train_sampler = train_set.get_smart_sampler(args.batch_size, shuffle=True)
+        training_data_loader = DataLoader(
+            dataset=train_set,
+            batch_sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
+        
+        # Validation typically doesn't need smart sampler but we can use it
+        val_sampler = validate_set.get_smart_sampler(args.batch_size, shuffle=False)
+        validate_data_loader = DataLoader(
+            dataset=validate_set,
+            batch_sampler=val_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
+    else:
+        # Standard DataLoader
+        training_data_loader = DataLoader(
+            dataset=train_set,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
 
-    validate_data_loader = DataLoader(
-        dataset=validate_set,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        shuffle=False,
-        pin_memory=True,
-        drop_last=False,
-        persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=2 if args.num_workers > 0 else None
-    )
+        validate_data_loader = DataLoader(
+            dataset=validate_set,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            shuffle=False,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
 
-    return training_data_loader, validate_data_loader
+    return training_data_loader, validate_data_loader, train_set, validate_set
 
 
-def train(args, training_data_loader, validate_data_loader):
+def train(args, training_data_loader, validate_data_loader, train_set, validate_set):
     """Main training loop."""
     # Initialize model
     model = Net(
@@ -220,7 +275,6 @@ def train(args, training_data_loader, validate_data_loader):
         model = nn.DataParallel(model)
 
     # Model expects all inputs to be the same size (tile_h x tile_w)
-    # The ratio parameter is used internally by the model for processing
     print("\nModel Architecture:")
     summary(
         model,
@@ -272,116 +326,124 @@ def train(args, training_data_loader, validate_data_loader):
 
     t_start = time.time()
 
-    # Training loop
-    for epoch in range(start_epoch, end_epoch + 1):
-        model.train()
-        epoch_train_loss = []
-        epoch_train_loss_l1 = []
-        epoch_train_loss_ergas = []
+    try:
+        # Training loop
+        for epoch in range(start_epoch, end_epoch + 1):
+            model.train()
+            epoch_train_loss = []
+            epoch_train_loss_l1 = []
+            epoch_train_loss_ergas = []
 
-        for iteration, batch in enumerate(training_data_loader, 1):
-            gt, ldr1, ldr2, sum1, sum2 = (
-                batch[0].to(args.device),
-                batch[1].to(args.device),
-                batch[2].to(args.device),
-                batch[3].to(args.device),
-                batch[4].to(args.device)
-            )
+            for iteration, batch in enumerate(training_data_loader, 1):
+                gt, ldr1, ldr2, sum1, sum2 = (
+                    batch[0].to(args.device),
+                    batch[1].to(args.device),
+                    batch[2].to(args.device),
+                    batch[3].to(args.device),
+                    batch[4].to(args.device)
+                )
 
-            optimizer.zero_grad()
-            sr = model(ldr1, ldr2, sum1, sum2)
+                optimizer.zero_grad()
+                sr = model(ldr1, ldr2, sum1, sum2)
 
-            # Optional: Save first batch of first epoch for debugging
-            if args.save_debug and epoch == start_epoch and iteration == 1:
-                save_batch_debug(gt, ldr1, ldr2, sr, epoch, iteration)
+                # Optional: Save first batch of first epoch for debugging
+                if args.save_debug and epoch == start_epoch and iteration == 1:
+                    save_batch_debug(gt, ldr1, ldr2, sr, epoch, iteration)
 
-            # Compute loss
+                # Compute loss
+                if args.use_ergas:
+                    loss_l1 = criterion_l1(sr, gt)
+                    loss_ergas = criterion_ergas(sr, gt)
+                    loss = loss_l1 + args.ergas_hp * loss_ergas
+                    epoch_train_loss_l1.append(loss_l1.item())
+                    epoch_train_loss_ergas.append(loss_ergas.item())
+                else:
+                    loss = criterion(sr, gt)
+
+                epoch_train_loss.append(loss.item())
+
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+
+                # Print progress
+                if iteration % args.print_freq == 0:
+                    print(f'Epoch: {epoch}/{end_epoch} | '
+                          f'Iter: {iteration}/{len(training_data_loader)} | '
+                          f'Loss: {loss.item():.6f} | '
+                          f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
+
+            # Epoch summary
+            t_loss = np.nanmean(np.array(epoch_train_loss))
             if args.use_ergas:
-                loss_l1 = criterion_l1(sr, gt)
-                loss_ergas = criterion_ergas(sr, gt)
-                loss = loss_l1 + args.ergas_hp * loss_ergas
-                epoch_train_loss_l1.append(loss_l1.item())
-                epoch_train_loss_ergas.append(loss_ergas.item())
+                print(f'\nEpoch {epoch}/{end_epoch} Training Summary:')
+                print(f'  Total Loss: {t_loss:.6f}')
+                print(f'  L1 Loss: {np.nanmean(np.array(epoch_train_loss_l1)):.6f}')
+                print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_train_loss_ergas)):.6f}')
             else:
-                loss = criterion(sr, gt)
+                print(f'\nEpoch {epoch}/{end_epoch} Training Loss: {t_loss:.6f}')
 
-            epoch_train_loss.append(loss.item())
+            # Validation
+            if epoch % args.val_freq == 0:
+                model.eval()
+                epoch_val_loss = []
+                epoch_val_loss_l1 = []
+                epoch_val_loss_ergas = []
 
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+                with torch.no_grad():
+                    for iteration, batch in enumerate(validate_data_loader, 1):
+                        gt, ldr1, ldr2, sum1, sum2 = (
+                            batch[0].to(args.device),
+                            batch[1].to(args.device),
+                            batch[2].to(args.device),
+                            batch[3].to(args.device),
+                            batch[4].to(args.device)
+                        )
 
-            # Print progress
-            if iteration % args.print_freq == 0:
-                print(f'Epoch: {epoch}/{end_epoch} | '
-                      f'Iter: {iteration}/{len(training_data_loader)} | '
-                      f'Loss: {loss.item():.6f} | '
-                      f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
+                        sr = model(ldr1, ldr2, sum1, sum2)
 
-        # Epoch summary
-        t_loss = np.nanmean(np.array(epoch_train_loss))
-        if args.use_ergas:
-            print(f'\nEpoch {epoch}/{end_epoch} Training Summary:')
-            print(f'  Total Loss: {t_loss:.6f}')
-            print(f'  L1 Loss: {np.nanmean(np.array(epoch_train_loss_l1)):.6f}')
-            print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_train_loss_ergas)):.6f}')
-        else:
-            print(f'\nEpoch {epoch}/{end_epoch} Training Loss: {t_loss:.6f}')
+                        if args.use_ergas:
+                            loss_l1 = criterion_l1(sr, gt)
+                            loss_ergas = criterion_ergas(sr, gt)
+                            loss = loss_l1 + args.ergas_hp * loss_ergas
+                            epoch_val_loss_l1.append(loss_l1.item())
+                            epoch_val_loss_ergas.append(loss_ergas.item())
+                        else:
+                            loss = criterion(sr, gt)
 
-        # Validation
-        if epoch % args.val_freq == 0:
-            model.eval()
-            epoch_val_loss = []
-            epoch_val_loss_l1 = []
-            epoch_val_loss_ergas = []
+                        epoch_val_loss.append(loss.item())
 
-            with torch.no_grad():
-                for iteration, batch in enumerate(validate_data_loader, 1):
-                    gt, ldr1, ldr2, sum1, sum2 = (
-                        batch[0].to(args.device),
-                        batch[1].to(args.device),
-                        batch[2].to(args.device),
-                        batch[3].to(args.device),
-                        batch[4].to(args.device)
-                    )
+                v_loss = np.nanmean(np.array(epoch_val_loss))
+                t_end = time.time()
 
-                    sr = model(ldr1, ldr2, sum1, sum2)
+                print(f'\n{"="*80}')
+                print(f'Validation Results:')
+                if args.use_ergas:
+                    print(f'  Total Loss: {v_loss:.6f}')
+                    print(f'  L1 Loss: {np.nanmean(np.array(epoch_val_loss_l1)):.6f}')
+                    print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_val_loss_ergas)):.6f}')
+                else:
+                    print(f'  Loss: {v_loss:.6f}')
+                print(f'Time elapsed: {(t_end - t_start):.2f}s')
+                print(f'{"="*80}\n')
 
-                    if args.use_ergas:
-                        loss_l1 = criterion_l1(sr, gt)
-                        loss_ergas = criterion_ergas(sr, gt)
-                        loss = loss_l1 + args.ergas_hp * loss_ergas
-                        epoch_val_loss_l1.append(loss_l1.item())
-                        epoch_val_loss_ergas.append(loss_ergas.item())
-                    else:
-                        loss = criterion(sr, gt)
+                t_start = time.time()
 
-                    epoch_val_loss.append(loss.item())
+            # Save checkpoint
+            if epoch % args.ckpt == 0:
+                save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
 
-            v_loss = np.nanmean(np.array(epoch_val_loss))
-            t_end = time.time()
-
-            print(f'\n{"="*80}')
-            print(f'Validation Results:')
-            if args.use_ergas:
-                print(f'  Total Loss: {v_loss:.6f}')
-                print(f'  L1 Loss: {np.nanmean(np.array(epoch_val_loss_l1)):.6f}')
-                print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_val_loss_ergas)):.6f}')
-            else:
-                print(f'  Loss: {v_loss:.6f}')
-            print(f'Time elapsed: {(t_end - t_start):.2f}s')
-            print(f'{"="*80}\n')
-
-            t_start = time.time()
-
-        # Save checkpoint
-        if epoch % args.ckpt == 0:
-            save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
-
-    # Save final checkpoint
-    save_checkpoint(args, model, optimizer, lr_scheduler, end_epoch)
-    print("\nTraining completed!")
+        # Save final checkpoint
+        save_checkpoint(args, model, optimizer, lr_scheduler, end_epoch)
+        print("\nTraining completed!")
+        
+    finally:
+        # Cleanup datasets
+        print("\nCleaning up resources...")
+        train_set.cleanup()
+        validate_set.cleanup()
+        print("Cleanup completed.")
 
 
 if __name__ == "__main__":
@@ -421,6 +483,20 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loader workers')
 
+    # DataLoader optimization features
+    parser.add_argument('--use_half', action='store_true',
+                        help='Use fp16 storage for 50%% memory reduction')
+    parser.add_argument('--num_load_threads', type=int, default=4,
+                        help='Number of parallel image loading threads')
+    parser.add_argument('--use_disk_cache', action='store_true',
+                        help='Cache preprocessed tiles to disk')
+    parser.add_argument('--disk_cache_dir', type=str, default='./tile_cache',
+                        help='Directory for disk cache')
+    parser.add_argument('--max_cached_pairs', type=int, default=16,
+                        help='Maximum number of pairs to keep in memory cache')
+    parser.add_argument('--use_smart_sampler', action='store_true',
+                        help='Use smart sampler for better cache locality')
+
     # Checkpointing and validation
     parser.add_argument('--ckpt', type=int, default=20,
                         help='Save checkpoint every N epochs')
@@ -457,7 +533,9 @@ if __name__ == "__main__":
     if args.stride_H > args.H or args.stride_W > args.W:
         print("Warning: Stride larger than tile size will create gaps in coverage")
 
-    print("\nTraining Configuration:")
+    print("\n" + "="*80)
+    print("Training Configuration:")
+    print("="*80)
     print(f"  Device: {args.device}")
     print(f"  Tile size: {args.H}x{args.W}")
     print(f"  Stride: {args.stride_H}x{args.stride_W}")
@@ -467,7 +545,7 @@ if __name__ == "__main__":
     print(f"  Use ERGAS: {args.use_ergas}")
     if args.use_ergas:
         print(f"  ERGAS weight: {args.ergas_hp}")
-    print()
+    print("="*80)
 
-    training_data_loader, validate_data_loader = prepare_training_data(args)
-    train(args, training_data_loader, validate_data_loader)
+    training_data_loader, validate_data_loader, train_set, validate_set = prepare_training_data(args)
+    train(args, training_data_loader, validate_data_loader, train_set, validate_set)

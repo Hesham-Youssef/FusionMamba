@@ -1,12 +1,16 @@
 # hdr_load_train_data.py
-# Simplified version with on-the-fly tile extraction only
-# + support for a split CSV (columns: scene, split)
+# Maximum optimization with parallel loading, shared memory, half-precision, and disk caching
 
 import os
 import glob
 import math
 import csv
+import pickle
 from pathlib import Path
+from functools import lru_cache
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 import cv2
@@ -17,127 +21,267 @@ import torch.utils.data as data
 
 
 # -----------------------------
+# Configuration
+# -----------------------------
+class Config:
+    USE_HALF_PRECISION = False  # Store in fp16 to save 50% memory
+    NUM_LOAD_THREADS = 4  # Parallel image loading
+    PREFETCH_SIZE = 2  # Number of pairs to prefetch
+    USE_DISK_CACHE = False  # Cache preprocessed tiles to disk
+    DISK_CACHE_DIR = None
+
+
+# -----------------------------
 # Utils
 # -----------------------------
 
-def _to_tensor_and_normalize(image_np, is_hdr=False):
-    """Convert HxWxC numpy image -> torch tensor CxHxW, dtype float32."""
-    img = image_np.astype(np.float32)
-    if not is_hdr:
-        if img.max() > 1.5:
-            img = img / 255.0
+def _to_tensor_fast(image_np, is_hdr=False, use_half=False):
+    """Optimized tensor conversion with optional fp16."""
+    # Avoid extra copy by checking dtype first
+    if image_np.dtype != np.float32:
+        img = image_np.astype(np.float32)
+    else:
+        img = image_np
+    
+    if not is_hdr and img.max() > 1.5:
+        img = img * (1.0 / 255.0)  # Slightly faster than division
+    
     if img.ndim == 2:
         img = img[:, :, None]
-    img_t = torch.from_numpy(img).permute(2, 0, 1).float()
-    return img_t
+    
+    # Direct memory view when possible
+    tensor = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
+    
+    if use_half:
+        return tensor.half()
+    return tensor.float()
 
 
-def make_hann_window(h, w, device=None, dtype=torch.float32):
-    if h == 1:
-        wh = torch.tensor([1.0], dtype=dtype, device=device)
-    else:
-        wh = torch.hann_window(h, periodic=False, dtype=dtype, device=device)
-    if w == 1:
-        ww = torch.tensor([1.0], dtype=dtype, device=device)
-    else:
-        ww = torch.hann_window(w, periodic=False, dtype=dtype, device=device)
+@lru_cache(maxsize=64)
+def make_hann_window(h, w, device_str='cpu', use_half=False):
+    """Cached Hann window with fp16 support."""
+    device = torch.device(device_str)
+    dtype = torch.float16 if use_half else torch.float32
+    
+    wh = torch.hann_window(h, periodic=False, dtype=dtype, device=device) if h > 1 else torch.ones(1, dtype=dtype, device=device)
+    ww = torch.hann_window(w, periodic=False, dtype=dtype, device=device) if w > 1 else torch.ones(1, dtype=dtype, device=device)
     return wh.unsqueeze(1) @ ww.unsqueeze(0)
 
 
+def load_image_fast(path):
+    """Fast image loading with BGR to RGB."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"Failed to read {path}")
+    # Vectorized color conversion
+    if img.ndim == 3 and img.shape[2] == 3:
+        return img[:, :, ::-1].copy()  # BGR to RGB via slicing
+    return img
+
+
 # -----------------------------
-# Tiling
+# Parallel Image Loader
+# -----------------------------
+class ParallelImageLoader:
+    """Thread pool for parallel image loading."""
+    
+    def __init__(self, num_threads=4):
+        self.executor = ThreadPoolExecutor(max_workers=num_threads)
+        self._cache = {}
+        self._lock = threading.Lock()
+    
+    def load_triplet(self, ldr1_path, ldr2_path, hdr_path):
+        """Load three images in parallel."""
+        futures = [
+            self.executor.submit(load_image_fast, ldr1_path),
+            self.executor.submit(load_image_fast, ldr2_path),
+            self.executor.submit(load_image_fast, hdr_path)
+        ]
+        return [f.result() for f in futures]
+    
+    def shutdown(self):
+        self.executor.shutdown(wait=True)
+
+
+# -----------------------------
+# Disk Cache Manager
+# -----------------------------
+class DiskCacheManager:
+    """Persistent disk cache for preprocessed tiles."""
+    
+    def __init__(self, cache_dir):
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_cache_path(self, pair_idx, tile_params):
+        """Generate cache file path."""
+        h, w, sh, sw = tile_params
+        return self.cache_dir / f"pair_{pair_idx}_t{h}x{w}_s{sh}x{sw}.pt"
+    
+    def load(self, pair_idx, tile_params):
+        """Load from disk cache."""
+        if not self.cache_dir:
+            return None
+        
+        cache_path = self.get_cache_path(pair_idx, tile_params)
+        if cache_path.exists():
+            try:
+                return torch.load(cache_path, map_location='cpu')
+            except:
+                return None
+        return None
+    
+    def save(self, pair_idx, tile_params, data):
+        """Save to disk cache."""
+        if not self.cache_dir:
+            return
+        
+        cache_path = self.get_cache_path(pair_idx, tile_params)
+        try:
+            torch.save(data, cache_path)
+        except:
+            pass  # Fail silently
+
+
+# -----------------------------
+# Optimized Tiling
 # -----------------------------
 
-def extract_tiles(img, tile_h, tile_w, stride_h=None, stride_w=None, pad_mode='reflect'):
-    """Extract tiles from a torch tensor `img` shaped (C,H,W)."""
-    assert isinstance(img, torch.Tensor)
-    assert img.ndim == 3
+def compute_tile_params(H, W, tile_h, tile_w, stride_h, stride_w):
+    """Compute tiling parameters."""
+    if H <= tile_h:
+        pad_top, pad_bottom = 0, tile_h - H
+        n_steps_h = 1
+    else:
+        n_steps_h = (H - tile_h + stride_h - 1) // stride_h + 1
+        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
+        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
 
+    if W <= tile_w:
+        pad_left, pad_right = 0, tile_w - W
+        n_steps_w = 1
+    else:
+        n_steps_w = (W - tile_w + stride_w - 1) // stride_w + 1
+        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
+        pad_left, pad_right = 0, max(0, full_covered_w - W)
+
+    return (pad_top, pad_bottom, pad_left, pad_right), n_steps_h, n_steps_w
+
+
+def extract_tiles_optimized(img, tile_h, tile_w, stride_h, stride_w, pad_mode='reflect'):
+    """Ultra-optimized tile extraction using unfold."""
     C, H, W = img.shape
-    stride_h = stride_h or tile_h
-    stride_w = stride_w or tile_w
-
-    # padding
-    if H <= tile_h:
-        pad_top, pad_bottom = 0, tile_h - H
-    else:
-        n_steps_h = math.ceil((H - tile_h) / float(stride_h)) + 1
-        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
-        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
-
-    if W <= tile_w:
-        pad_left, pad_right = 0, tile_w - W
-    else:
-        n_steps_w = math.ceil((W - tile_w) / float(stride_w)) + 1
-        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
-        pad_left, pad_right = 0, max(0, full_covered_w - W)
-
-    if any(x > 0 for x in (pad_top, pad_bottom, pad_left, pad_right)):
-        img_p = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
-    else:
-        img_p = img
-
-    _, Hp, Wp = img_p.shape
-    tiles, coords = [], []
-    for y in range(0, Hp - tile_h + 1, stride_h):
-        for x in range(0, Wp - tile_w + 1, stride_w):
-            tile = img_p[:, y:y + tile_h, x:x + tile_w]
-            y0 = max(0, y - pad_top)
-            x0 = max(0, x - pad_left)
-            y1 = min(H, y - pad_top + tile_h)
-            x1 = min(W, x - pad_left + tile_w)
-            tiles.append(tile)
-            coords.append((y0, y1, x0, x1))
-
-    return tiles, coords, (H, W), (pad_top, pad_bottom, pad_left, pad_right)
-
-
-def _compute_coords_for_shape(H, W, tile_h, tile_w, stride_h, stride_w):
-    """Compute coords list and pad info for an image shape (H,W) without extracting tiles."""
-    stride_h = stride_h or tile_h
-    stride_w = stride_w or tile_w
-
-    if H <= tile_h:
-        pad_top, pad_bottom = 0, tile_h - H
-    else:
-        n_steps_h = math.ceil((H - tile_h) / float(stride_h)) + 1
-        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
-        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
-
-    if W <= tile_w:
-        pad_left, pad_right = 0, tile_w - W
-    else:
-        n_steps_w = math.ceil((W - tile_w) / float(stride_w)) + 1
-        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
-        pad_left, pad_right = 0, max(0, full_covered_w - W)
-
-    Hp = H + pad_top + pad_bottom
-    Wp = W + pad_left + pad_right
-
+    
+    pad_info, n_h, n_w = compute_tile_params(H, W, tile_h, tile_w, stride_h, stride_w)
+    pad_top, pad_bottom, pad_left, pad_right = pad_info
+    
+    # Minimize padding operations
+    needs_pad = any(x > 0 for x in pad_info)
+    if needs_pad:
+        img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
+    
+    # Single unfold operation for all tiles
+    tiles = img.unfold(1, tile_h, stride_h).unfold(2, tile_w, stride_w)
+    tiles = tiles.permute(1, 2, 0, 3, 4).reshape(-1, C, tile_h, tile_w)
+    
+    # Vectorized coordinate generation
+    ys = torch.arange(n_h) * stride_h - pad_top
+    xs = torch.arange(n_w) * stride_w - pad_left
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    
     coords = []
-    for y in range(0, Hp - tile_h + 1, stride_h):
-        for x in range(0, Wp - tile_w + 1, stride_w):
-            y0 = max(0, y - pad_top)
-            x0 = max(0, x - pad_left)
-            y1 = min(H, y - pad_top + tile_h)
-            x1 = min(W, x - pad_left + tile_w)
-            coords.append((y0, y1, x0, x1))
+    for i in range(n_h * n_w):
+        y, x = yy.flatten()[i].item(), xx.flatten()[i].item()
+        y0, x0 = max(0, y), max(0, x)
+        y1, x1 = min(H, y + tile_h), min(W, x + tile_w)
+        coords.append((y0, y1, x0, x1))
+    
+    return tiles, coords, (H, W)
 
-    return coords, (pad_top, pad_bottom, pad_left, pad_right)
+
+def compute_summary_fast(ldr, tiles, coords, orig_shape, tile_h, tile_w, use_half=False):
+    """Optimized summary with minimal allocations."""
+    H, W = orig_shape
+    C, device, dtype = ldr.shape[0], ldr.device, ldr.dtype
+    
+    # Reuse buffers
+    merged = torch.zeros((C, H, W), dtype=dtype, device=device)
+    weights = torch.zeros((1, H, W), dtype=dtype, device=device)
+    window = make_hann_window(tile_h, tile_w, str(device), use_half)
+    
+    # Batch process tiles when possible
+    for idx, (y0, y1, x0, x1) in enumerate(coords):
+        vh, vw = y1 - y0, x1 - x0
+        w = window[:vh, :vw].unsqueeze(0)
+        # In-place operations
+        merged[:, y0:y1, x0:x1].add_(tiles[idx, :, :vh, :vw].mul(w))
+        weights[:, y0:y1, x0:x1].add_(w)
+    
+    merged.div_(weights.clamp_(min=1e-8))
+    
+    # Fast downsampling
+    return F.adaptive_avg_pool2d(merged.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
 
 
 # -----------------------------
-# Dataset
+# Smart Sampler - groups tiles from same pair
 # -----------------------------
-class HDRDatasetTiles(data.Dataset):
+class SmartBatchSampler(data.Sampler):
+    """Sampler that groups tiles from same pairs for cache efficiency."""
+    
+    def __init__(self, tile_index, batch_size, shuffle=True):
+        self.tile_index = tile_index
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Group indices by pair
+        self.pair_groups = defaultdict(list)
+        for idx, (pair_idx, tile_idx) in enumerate(tile_index):
+            self.pair_groups[pair_idx].append(idx)
+    
+    def __iter__(self):
+        # Shuffle within each pair's tiles
+        all_indices = []
+        pair_keys = list(self.pair_groups.keys())
+        
+        if self.shuffle:
+            import random
+            random.shuffle(pair_keys)
+        
+        for pair_idx in pair_keys:
+            indices = self.pair_groups[pair_idx].copy()
+            if self.shuffle:
+                import random
+                random.shuffle(indices)
+            all_indices.extend(indices)
+        
+        # Yield batches
+        for i in range(0, len(all_indices), self.batch_size):
+            yield all_indices[i:i + self.batch_size]
+    
+    def __len__(self):
+        return (len(self.tile_index) + self.batch_size - 1) // self.batch_size
+
+
+# -----------------------------
+# Maximum Performance Dataset
+# -----------------------------
+class HDRDatasetMaxPerf(data.Dataset):
+    """Ultimate optimized dataset with all performance features."""
+    
     def __init__(self, data_dir, use_log=True, transform=None,
-                 tile_h=None, tile_w=None, stride_h=None, stride_w=None,
-                 split=None, split_scenes=None):
+                 tile_h=256, tile_w=256, stride_h=None, stride_w=None,
+                 split=None, split_scenes=None,
+                 max_cached_pairs=16, use_half=False, 
+                 num_load_threads=4, use_disk_cache=False, disk_cache_dir=None):
         """
-        split: 'train', 'val', or None
-        split_scenes: list or set of scene names to include in this split (optional)
+        Args:
+            use_half: Store tiles in fp16 (50% memory reduction)
+            num_load_threads: Parallel image loading threads
+            use_disk_cache: Cache preprocessed tiles to disk
+            disk_cache_dir: Directory for disk cache
         """
-
         self.data_dir = data_dir
         self.use_log = use_log
         self.transform = transform
@@ -145,208 +289,289 @@ class HDRDatasetTiles(data.Dataset):
         self.tile_w = tile_w
         self.stride_h = stride_h or tile_h
         self.stride_w = stride_w or tile_w
-        self.split = split
-        self.split_scenes = set(split_scenes) if split_scenes is not None else None
-
-        # scenes / pairs
+        self.use_half = use_half
+        self.max_cached_pairs = max_cached_pairs
+        
+        # Initialize components
+        self.loader = ParallelImageLoader(num_load_threads)
+        self.disk_cache = DiskCacheManager(disk_cache_dir if use_disk_cache else None)
+        
+        # Build pairs
         all_scenes = sorted(os.listdir(data_dir))
-        self.scenes = []
+        split_scenes_set = set(split_scenes) if split_scenes else None
         self.pairs = []
+        
         for scene in all_scenes:
-            if not os.path.isdir(os.path.join(data_dir, scene)):
-                continue
-            # Apply split filter if provided
-            if self.split_scenes is not None and scene not in self.split_scenes:
-                continue
-            self.scenes.append(scene)
             scene_path = os.path.join(data_dir, scene)
+            if not os.path.isdir(scene_path):
+                continue
+            if split_scenes_set and scene not in split_scenes_set:
+                continue
+            
             ldr_files = sorted(
                 f for f in glob.glob(os.path.join(scene_path, "input_*.tif"))
                 if "_aligned" not in os.path.basename(f)
             )
             hdr_files = glob.glob(os.path.join(scene_path, "ref_hdr.hdr"))
-            if not hdr_files or len(ldr_files) < 2:
+            
+            if not hdr_files or len(ldr_files) < 3:
                 continue
+            
             hdr = hdr_files[0]
-            # create pairs
-            # note: keep same pairing logic as before
             self.pairs.append({'ldr1': ldr_files[1], 'ldr2': ldr_files[0], 'hdr': hdr})
             self.pairs.append({'ldr1': ldr_files[1], 'ldr2': ldr_files[2], 'hdr': hdr})
-
+        
         if not self.pairs:
-            raise RuntimeError(f"No valid pairs found for split={split}")
-
-        self.tiles_index = []
-
-        if self.tile_h is not None:
-            self._build_in_memory_index()
-
-    def _build_in_memory_index(self):
-        """Create tiles_index for accessing individual tiles."""
-        self.tiles_index = []
+            raise RuntimeError("No valid pairs found")
+        
+        # Caches
+        self._memory_cache = OrderedDict()
+        self._tile_index = []
+        self._access_count = defaultdict(int)  # Track access frequency
+        
+        self._build_index()
+    
+    def _build_index(self):
+        """Build index with shape metadata."""
+        print("Building high-performance index...")
+        
         for pair_idx, pair in enumerate(self.pairs):
-            # read shape quickly (use hdr image as reference for shape)
             img = cv2.imread(pair['hdr'], cv2.IMREAD_UNCHANGED)
-            if img is None:
-                raise RuntimeError(f"Failed to read image for pair {pair_idx}")
-            H, W = img.shape[0], img.shape[1]
-            coords, pad_info = _compute_coords_for_shape(H, W, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
-            for t in range(len(coords)):
-                self.tiles_index.append((pair_idx, t))
-        print(f"Built in-memory tile index: {len(self.tiles_index)} tiles")
-
-    def _load_images(self, pair):
-        ldr1 = cv2.imread(pair['ldr1'], cv2.IMREAD_UNCHANGED)
-        ldr2 = cv2.imread(pair['ldr2'], cv2.IMREAD_UNCHANGED)
-        hdr = cv2.imread(pair['hdr'], cv2.IMREAD_UNCHANGED)
-        for x in (ldr1, ldr2, hdr):
-            if x is None:
-                raise RuntimeError("Failed to read image")
-        if ldr1.ndim == 3:
-            ldr1 = cv2.cvtColor(ldr1, cv2.COLOR_BGR2RGB)
-            ldr2 = cv2.cvtColor(ldr2, cv2.COLOR_BGR2RGB)
-        if hdr.ndim == 3:
-            hdr = cv2.cvtColor(hdr, cv2.COLOR_BGR2RGB)
-        t1 = _to_tensor_and_normalize(ldr1, False)
-        t2 = _to_tensor_and_normalize(ldr2, False)
-        tg = _to_tensor_and_normalize(hdr, True)
+            H, W = img.shape[:2]
+            del img  # Free immediately
+            
+            _, n_h, n_w = compute_tile_params(
+                H, W, self.tile_h, self.tile_w, self.stride_h, self.stride_w
+            )
+            n_tiles = n_h * n_w
+            
+            for t in range(n_tiles):
+                self._tile_index.append((pair_idx, t))
+        
+        print(f"Index: {len(self._tile_index)} tiles, {len(self.pairs)} pairs")
+        if self.use_half:
+            print("Using fp16 storage (50% memory reduction)")
+    
+    def _load_pair_data(self, pair_idx):
+        """Load with disk cache, memory cache, and parallel loading."""
+        # Check memory cache
+        if pair_idx in self._memory_cache:
+            self._memory_cache.move_to_end(pair_idx)
+            self._access_count[pair_idx] += 1
+            return self._memory_cache[pair_idx]
+        
+        # Check disk cache
+        tile_params = (self.tile_h, self.tile_w, self.stride_h, self.stride_w)
+        cached = self.disk_cache.load(pair_idx, tile_params)
+        if cached is not None:
+            self._add_to_memory_cache(pair_idx, cached)
+            return cached
+        
+        # Load from disk with parallel reading
+        pair = self.pairs[pair_idx]
+        ldr1, ldr2, hdr = self.loader.load_triplet(
+            pair['ldr1'], pair['ldr2'], pair['hdr']
+        )
+        
+        # Convert to tensors
+        t1 = _to_tensor_fast(ldr1, False, self.use_half)
+        t2 = _to_tensor_fast(ldr2, False, self.use_half)
+        tg = _to_tensor_fast(hdr, True, self.use_half)
+        
         if self.use_log:
             tg = torch.log1p(torch.clamp(tg, min=0))
+        
         if self.transform:
             tg, t1, t2 = self.transform(tg, t1, t2)
-        return tg, t1, t2
-
-    def _compute_summary(self, ldr1, ldr2, tiles1, tiles2, coords, orig_shape):
-        H, W = orig_shape
-        win = make_hann_window(self.tile_h, self.tile_w, device=ldr1.device, dtype=ldr1.dtype)
-
-        def merge(tiles, base):
-            out = torch.zeros_like(base)
-            wgt = torch.zeros((1, H, W), dtype=base.dtype)
-            for tile, (y0, y1, x0, x1) in zip(tiles, coords):
-                vh, vw = y1 - y0, x1 - x0
-                ws = win[:vh, :vw].unsqueeze(0)
-                out[:, y0:y1, x0:x1] += tile[:, :vh, :vw] * ws
-                wgt[:, y0:y1, x0:x1] += ws
-            return out / (wgt + 1e-8)
-
-        s1 = merge(tiles1, ldr1)
-        s2 = merge(tiles2, ldr2)
-        s1 = F.adaptive_avg_pool2d(s1.unsqueeze(0), (self.tile_h, self.tile_w)).squeeze(0)
-        s2 = F.adaptive_avg_pool2d(s2.unsqueeze(0), (self.tile_h, self.tile_w)).squeeze(0)
-        return s1, s2
-
+        
+        # Extract all tiles at once
+        tiles_g, coords, shape = extract_tiles_optimized(
+            tg, self.tile_h, self.tile_w, self.stride_h, self.stride_w
+        )
+        tiles1, _, _ = extract_tiles_optimized(
+            t1, self.tile_h, self.tile_w, self.stride_h, self.stride_w
+        )
+        tiles2, _, _ = extract_tiles_optimized(
+            t2, self.tile_h, self.tile_w, self.stride_h, self.stride_w
+        )
+        
+        # Compute summaries
+        sum1 = compute_summary_fast(t1, tiles1, coords, shape, self.tile_h, self.tile_w, self.use_half)
+        sum2 = compute_summary_fast(t2, tiles2, coords, shape, self.tile_h, self.tile_w, self.use_half)
+        
+        data = {
+            'tiles_g': tiles_g,
+            'tiles1': tiles1,
+            'tiles2': tiles2,
+            'sum1': sum1,
+            'sum2': sum2
+        }
+        
+        # Cache to disk and memory
+        self.disk_cache.save(pair_idx, tile_params, data)
+        self._add_to_memory_cache(pair_idx, data)
+        
+        return data
+    
+    def _add_to_memory_cache(self, pair_idx, data):
+        """Add to memory cache with smart eviction."""
+        self._memory_cache[pair_idx] = data
+        self._memory_cache.move_to_end(pair_idx)
+        self._access_count[pair_idx] += 1
+        
+        # Smart eviction: remove least frequently accessed
+        while len(self._memory_cache) > self.max_cached_pairs:
+            # Find least accessed
+            lru_key = min(self._memory_cache.keys(), 
+                         key=lambda k: self._access_count[k])
+            self._memory_cache.pop(lru_key)
+    
     def __len__(self):
-        return len(self.tiles_index)
-
+        return len(self._tile_index)
+    
     def __getitem__(self, idx):
-        pair_idx, tile_idx = self.tiles_index[idx]
-        pair = self.pairs[pair_idx]
+        pair_idx, tile_idx = self._tile_index[idx]
+        data = self._load_pair_data(pair_idx)
+        
+        tiles = (
+            data['tiles_g'][tile_idx],
+            data['tiles1'][tile_idx],
+            data['tiles2'][tile_idx],
+            data['sum1'],
+            data['sum2']
+        )
+        
+        # Convert back to fp32 if needed for training
+        if self.use_half:
+            return tuple(t.float() if t.dtype == torch.float16 else t for t in tiles)
+        return tiles
+    
+    def get_smart_sampler(self, batch_size, shuffle=True):
+        """Get sampler that groups tiles from same pairs."""
+        return SmartBatchSampler(self._tile_index, batch_size, shuffle)
+    
+    def cleanup(self):
+        """Cleanup resources."""
+        self.loader.shutdown()
+        self._memory_cache.clear()
 
-        # Load images and extract tiles on-the-fly
-        tg, t1, t2 = self._load_images(pair)
-        tiles_g, coords, orig_shape, _ = extract_tiles(tg, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
-        tiles1, _, _, _ = extract_tiles(t1, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
-        tiles2, _, _, _ = extract_tiles(t2, self.tile_h, self.tile_w, self.stride_h, self.stride_w)
-        sum1, sum2 = self._compute_summary(t1, t2, tiles1, tiles2, coords, orig_shape)
 
-        return tiles_g[tile_idx], tiles1[tile_idx], tiles2[tile_idx], sum1, sum2
+# Aliases
+HDRDatasetTiles = HDRDatasetMaxPerf
 
 
 # -----------------------------
-# CSV split helper
+# CSV helper
 # -----------------------------
 def read_split_csv(csv_path, split_name):
-    """
-    Read a CSV with columns 'scene' and 'split' and return a set of scenes matching split_name.
-    split_name: e.g. 'train' or 'val'
-    """
+    """Read CSV with 'scene' and 'split' columns."""
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Split CSV not found: {csv_path}")
-
+    
     scenes = set()
     with open(csv_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter=',', skipinitialspace=True)
-        # support TSV-like or Excel-exported files: accept either delimiter tab or comma
-        # if headers appear to be tab-separated, try tab
+        # Try comma first
+        sample = f.read(1024)
+        f.seek(0)
+        delimiter = ',' if ',' in sample else '\t'
+        
+        reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
         if 'scene' not in reader.fieldnames or 'split' not in reader.fieldnames:
-            # try tab delimiter
-            f.seek(0)
-            reader = csv.DictReader(f, delimiter='\t', skipinitialspace=True)
-            if 'scene' not in reader.fieldnames or 'split' not in reader.fieldnames:
-                raise RuntimeError("CSV must contain 'scene' and 'split' columns (tab or comma separated).")
+            raise RuntimeError("CSV must contain 'scene' and 'split' columns")
+        
         for row in reader:
-            scene = row.get('scene')
-            sp = row.get('split')
-            if scene is None or sp is None:
-                continue
-            scene = scene.strip()
-            sp = sp.strip()
-            if sp == split_name:
+            scene, sp = row.get('scene', '').strip(), row.get('split', '').strip()
+            if scene and sp == split_name:
                 scenes.add(scene)
+    
     return scenes
 
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
     import argparse
-
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--split_csv", default=None,
-                        help="Path to CSV file with columns 'scene' and 'split'. Example: scene\\tsplit")
-    parser.add_argument("--split", choices=['train', 'val', 'all'], default='all',
-                        help="Which split to load (requires --split_csv). 'all' loads all scenes.")
+    parser.add_argument("--split_csv", default=None)
+    parser.add_argument("--split", choices=['train', 'val', 'all'], default='all')
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--tile_h", type=int, default=256)
     parser.add_argument("--tile_w", type=int, default=256)
     parser.add_argument("--stride_h", type=int, default=192)
     parser.add_argument("--stride_w", type=int, default=192)
+    parser.add_argument("--max_cached_pairs", type=int, default=16)
+    parser.add_argument("--use_half", action='store_true',
+                        help="Use fp16 storage (50% memory reduction)")
+    parser.add_argument("--num_load_threads", type=int, default=4,
+                        help="Parallel image loading threads")
+    parser.add_argument("--use_disk_cache", action='store_true',
+                        help="Cache preprocessed tiles to disk")
+    parser.add_argument("--disk_cache_dir", default="./tile_cache",
+                        help="Directory for disk cache")
+    parser.add_argument("--use_smart_sampler", action='store_true',
+                        help="Use smart sampler for better cache locality")
     args = parser.parse_args()
-
+    
     split_scenes = None
-    if args.split_csv is not None and args.split != 'all':
+    if args.split_csv and args.split != 'all':
         split_scenes = read_split_csv(args.split_csv, args.split)
-        # warn about scenes listed in CSV but not present in data_dir
         available = set(p.name for p in Path(args.data_dir).iterdir() if p.is_dir())
-        missing = split_scenes - available
-        if missing:
-            print(f"Warning: {len(missing)} scenes listed in CSV (split={args.split}) were not found in {args.data_dir}:")
-            for m in sorted(missing)[:20]:
-                print("  -", m)
-            # silently ignore missing scenes; dataset will include the intersection
         split_scenes = sorted(list(split_scenes & available))
-        print(f"Using {len(split_scenes)} scenes for split='{args.split}'")
-
-    # Create dataset with on-the-fly tile extraction
-    ds = HDRDatasetTiles(
+        print(f"Using {len(split_scenes)} scenes for '{args.split}'")
+    
+    ds = HDRDatasetMaxPerf(
         args.data_dir,
         tile_h=args.tile_h, tile_w=args.tile_w,
         stride_h=args.stride_h, stride_w=args.stride_w,
         split=args.split if args.split != 'all' else None,
-        split_scenes=split_scenes
+        split_scenes=split_scenes,
+        max_cached_pairs=args.max_cached_pairs,
+        use_half=args.use_half,
+        num_load_threads=args.num_load_threads,
+        use_disk_cache=args.use_disk_cache,
+        disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
     )
-
-    print(f"Dataset length: {len(ds)} tiles")
-    print(f"Creating DataLoader with {args.num_workers} workers...")
-
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=2 if args.num_workers > 0 else None
-    )
-
-    print("Testing DataLoader...")
+    
+    print(f"Dataset: {len(ds)} tiles")
+    print(f"Features: half={args.use_half}, threads={args.num_load_threads}, "
+          f"disk_cache={args.use_disk_cache}, smart_sampler={args.use_smart_sampler}")
+    
+    # Use smart sampler if requested
+    if args.use_smart_sampler:
+        sampler = ds.get_smart_sampler(args.batch_size, shuffle=True)
+        loader = DataLoader(
+            ds,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
+    else:
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=args.num_workers > 0,
+            prefetch_factor=2 if args.num_workers > 0 else None
+        )
+    
+    print("Testing maximum performance DataLoader...")
+    import time
+    start = time.time()
+    
     for i, (gt, l1, l2, s1, s2) in enumerate(loader):
-        print(f"Batch {i}: gt={gt.shape}, ldr1={l1.shape}, ldr2={l2.shape}, "
-              f"sum1={s1.shape}, sum2={s2.shape}")
-        if i >= 2:
+        if i == 0:
+            print(f"Batch shape: gt={gt.shape}, dtype={gt.dtype}")
+        if i >= 10:
             break
-
-    print("Success! DataLoader working correctly.")
+    
+    elapsed = time.time() - start
+    print(f"✓ Loaded 10 batches in {elapsed:.2f}s ({10/elapsed:.1f} batches/sec)")
+    
+    ds.cleanup()
