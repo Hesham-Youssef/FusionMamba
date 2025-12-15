@@ -166,7 +166,7 @@ class U2Net(nn.Module):
             nn.Sigmoid()
         )
         self.skip_alpha_param = nn.Parameter(torch.tensor(0.0))
-        # self.output_scale = nn.Parameter(torch.tensor(2.0))
+        self.output_scale = nn.Parameter(torch.tensor(2.0))
 
 
     def forward(self, img1, img2, sum1, sum2):
