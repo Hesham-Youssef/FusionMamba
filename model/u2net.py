@@ -166,7 +166,7 @@ class U2Net(nn.Module):
             nn.Sigmoid()
         )
         self.skip_alpha_param = nn.Parameter(torch.tensor(0.0))
-        self.output_scale = nn.Parameter(torch.tensor(2.0))
+        self.output_scale = nn.Parameter(torch.ones(1, 1, 1, 1) * 2.0)
 
 
     def forward(self, img1, img2, sum1, sum2):
@@ -196,7 +196,7 @@ class U2Net(nn.Module):
         # spectral attention
         output = output * (img1_spe_attn + img2_spe_attn)
         
-        # output = output * self.output_scale.view(1, 1, 1, 1)
+        output = output * self.output_scale
 
         gate_in = torch.cat([org_img1, output], dim=1)   # (B, 6, H, W)
         gate = self.skip_gate(gate_in)                    # (B, 1, H, W)
