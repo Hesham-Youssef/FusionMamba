@@ -218,7 +218,7 @@ def prepare_training_data(args):
             batch_sampler=train_sampler,
             num_workers=args.num_workers,
             pin_memory=False,
-            persistent_workers=True if args.num_workers > 0 else False,
+            persistent_workers=False if args.num_workers > 0 else False,
             prefetch_factor=1 if args.num_workers > 0 else None
         )
         
@@ -229,7 +229,7 @@ def prepare_training_data(args):
             batch_sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=False,
-            persistent_workers=True if args.num_workers > 0 else False,
+            persistent_workers=False if args.num_workers > 0 else False,
             prefetch_factor=1 if args.num_workers > 0 else None
         )
     else:
@@ -241,7 +241,7 @@ def prepare_training_data(args):
             shuffle=True,
             pin_memory=False,
             drop_last=True,
-            persistent_workers=True if args.num_workers > 0 else False,
+            persistent_workers=False if args.num_workers > 0 else False,
             prefetch_factor=1 if args.num_workers > 0 else None
         )
 
@@ -252,7 +252,7 @@ def prepare_training_data(args):
             shuffle=False,
             pin_memory=False,
             drop_last=False,
-            persistent_workers=True if args.num_workers > 0 else False,
+            persistent_workers=False if args.num_workers > 0 else False,
             prefetch_factor=1 if args.num_workers > 0 else None
         )
 
