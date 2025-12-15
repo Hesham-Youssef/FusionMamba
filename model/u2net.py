@@ -196,7 +196,7 @@ class U2Net(nn.Module):
         # spectral attention
         output = output * (img1_spe_attn + img2_spe_attn)
         
-        output = output * self.output_scale
+        output = output * self.output_scale.view(1, 1, 1, 1)
 
         gate_in = torch.cat([org_img1, output], dim=1)   # (B, 6, H, W)
         gate = self.skip_gate(gate_in)                    # (B, 1, H, W)
