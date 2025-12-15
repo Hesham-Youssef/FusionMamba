@@ -161,7 +161,9 @@ def prepare_training_data(args):
             use_half=args.use_half,
             num_load_threads=args.num_load_threads,
             use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
+            summary_only=args.summary_only,
+            disk_max_size_bytes=args.disk_max_size_bytes
         )
 
         validate_set = HDRDatasetMaxPerf(
@@ -173,8 +175,7 @@ def prepare_training_data(args):
             max_cached_pairs=args.max_cached_pairs,
             use_half=args.use_half,
             num_load_threads=args.num_load_threads,
-            use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
+            use_disk_cache=False
         )
 
     else:
@@ -190,7 +191,9 @@ def prepare_training_data(args):
             use_half=args.use_half,
             num_load_threads=args.num_load_threads,
             use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
+            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
+            summary_only=args.summary_only,
+            disk_max_size_bytes=args.disk_max_size_bytes
         )
 
         validate_set = HDRDatasetMaxPerf(
@@ -200,8 +203,7 @@ def prepare_training_data(args):
             max_cached_pairs=args.max_cached_pairs,
             use_half=args.use_half,
             num_load_threads=args.num_load_threads,
-            use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
+            use_disk_cache=False
         )
 
     print(f"Training tiles: {len(train_set)}")
@@ -486,6 +488,8 @@ if __name__ == "__main__":
     # DataLoader optimization features
     parser.add_argument('--use_half', action='store_true',
                         help='Use fp16 storage for 50%% memory reduction')
+    parser.add_argument('--summary_only', type=bool, default=True)
+    parser.add_argument('--disk_max_size_bytes', type=int, default=5 * (1024 ** 3))
     parser.add_argument('--num_load_threads', type=int, default=4,
                         help='Number of parallel image loading threads')
     parser.add_argument('--use_disk_cache', action='store_true',

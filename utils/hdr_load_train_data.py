@@ -103,46 +103,186 @@ class ParallelImageLoader:
         self.executor.shutdown(wait=True)
 
 
-# -----------------------------
-# Disk Cache Manager
-# -----------------------------
 class DiskCacheManager:
-    """Persistent disk cache for preprocessed tiles."""
-    
-    def __init__(self, cache_dir):
+    """
+    Disk cache manager that:
+     - saves compressed .npz files per pair
+     - optionally caches summaries only (smaller)
+     - enforces a max total cache size (LRU eviction)
+    Usage:
+      disk_cache = DiskCacheManager(cache_dir, max_size_bytes=5*1024**3,
+                                    summary_only=True, downsample_factor=4, use_half=True)
+    """
+
+    INDEX_NAME = "cache_index.json"
+
+    def __init__(self, cache_dir, max_size_bytes=None,
+                 summary_only=False, downsample_factor=4, use_half=False):
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.max_size_bytes = int(max_size_bytes) if max_size_bytes is not None else None
+        self.summary_only = summary_only
+        self.downsample_factor = max(1, int(downsample_factor))
+        self.use_half = use_half
+
+        self._lock = threading.Lock()
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    def get_cache_path(self, pair_idx, tile_params):
-        """Generate cache file path."""
+            self._index_path = self.cache_dir / self.INDEX_NAME
+            self._load_index()
+        else:
+            self._index = {}
+
+    def _load_index(self):
+        try:
+            if self._index_path.exists():
+                with open(self._index_path, 'r') as f:
+                    self._index = json.load(f)
+            else:
+                self._index = {}
+        except Exception:
+            self._index = {}
+
+    def _save_index(self):
+        try:
+            with open(self._index_path, 'w') as f:
+                json.dump(self._index, f)
+        except Exception:
+            pass
+
+    def _make_filename(self, pair_idx, tile_params):
         h, w, sh, sw = tile_params
-        return self.cache_dir / f"pair_{pair_idx}_t{h}x{w}_s{sh}x{sw}.pt"
-    
+        mode = "sum" if self.summary_only else "full"
+        return f"pair_{pair_idx}_t{h}x{w}_s{sh}x{sw}_{mode}.npz"
+
+    def _get_total_size(self):
+        total = 0
+        for v in self._index.values():
+            total += v.get("size", 0)
+        return total
+
+    def _evict_if_needed(self):
+        """Evict oldest files until under max_size_bytes."""
+        if self.max_size_bytes is None:
+            return
+        total = self._get_total_size()
+        if total <= self.max_size_bytes:
+            return
+
+        # sort by atime (oldest first)
+        items = sorted(self._index.items(), key=lambda kv: kv[1].get("atime", 0))
+        for name, meta in items:
+            try:
+                p = self.cache_dir / name
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+            total -= meta.get("size", 0)
+            self._index.pop(name, None)
+            if total <= self.max_size_bytes:
+                break
+        self._save_index()
+
     def load(self, pair_idx, tile_params):
-        """Load from disk cache."""
+        """Load cached data (returns dict of tensors) or None."""
         if not self.cache_dir:
             return None
-        
-        cache_path = self.get_cache_path(pair_idx, tile_params)
-        if cache_path.exists():
-            try:
-                return torch.load(cache_path, map_location='cpu')
-            except:
-                return None
-        return None
-    
-    def save(self, pair_idx, tile_params, data):
-        """Save to disk cache."""
+        fname = self._make_filename(pair_idx, tile_params)
+        p = self.cache_dir / fname
+        if not p.exists():
+            return None
+        try:
+            npz = np.load(str(p), allow_pickle=False)
+            out = {}
+            # Convert stored arrays back to torch tensors
+            for k in npz.files:
+                arr = npz[k]
+                t = torch.from_numpy(arr)
+                # keep dtype as stored (likely float16)
+                out[k] = t
+            # update atime in index
+            with self._lock:
+                meta = self._index.get(fname, {})
+                meta["atime"] = time.time()
+                self._index[fname] = meta
+                self._save_index()
+            return out
+        except Exception:
+            return None
+
+    def save(self, pair_idx, tile_params, data: dict):
+        """
+        Save `data` dict (torch tensors expected) to compressed .npz.
+        If summary_only=True, pick only sum1/sum2 and a small downsampled tiles_g.
+        """
         if not self.cache_dir:
             return
-        
-        cache_path = self.get_cache_path(pair_idx, tile_params)
-        try:
-            torch.save(data, cache_path)
-        except:
-            pass  # Fail silently
+        fname = self._make_filename(pair_idx, tile_params)
+        p = self.cache_dir / fname
 
+        try:
+            to_save = {}
+            # Option: only cache summaries & a tiny downsample of tiles_g
+            if self.summary_only:
+                # expect keys 'sum1' & 'sum2' exist
+                if 'sum1' in data:
+                    a = data['sum1'].cpu().numpy()
+                    if self.use_half:
+                        a = a.astype(np.float16)
+                    to_save['sum1'] = a
+                if 'sum2' in data:
+                    a = data['sum2'].cpu().numpy()
+                    if self.use_half:
+                        a = a.astype(np.float16)
+                    to_save['sum2'] = a
+
+                # optionally save a small downsample of tiles_g to help warm-start
+                if 'tiles_g' in data and hasattr(data['tiles_g'], "shape"):
+                    tiles_g = data['tiles_g'].cpu()
+                    # downsample spatially per-tile
+                    try:
+                        import math
+                        import torch.nn.functional as F
+                        small = F.adaptive_avg_pool2d(tiles_g, (max(1, tiles_g.shape[-2] // self.downsample_factor),
+                                                              max(1, tiles_g.shape[-1] // self.downsample_factor)))
+                        arr = small.numpy()
+                        if self.use_half:
+                            arr = arr.astype(np.float16)
+                        to_save['tiles_g_small'] = arr
+                    except Exception:
+                        pass
+            else:
+                # full cache: store all arrays in data (but convert to cpu numpy and fp16 if requested)
+                for k, v in data.items():
+                    try:
+                        if isinstance(v, torch.Tensor):
+                            a = v.cpu().numpy()
+                        else:
+                            # if it's a numpy already or list
+                            a = np.asarray(v)
+                        if self.use_half and a.dtype == np.float32:
+                            a = a.astype(np.float16)
+                        to_save[k] = a
+                    except Exception:
+                        # skip non-serializable entry
+                        continue
+
+            # atomic write via temporary file
+            tmp = p.with_suffix('.tmp.npz')
+            np.savez_compressed(str(tmp), **to_save)
+            tmp.replace(p)
+
+            size = p.stat().st_size
+            with self._lock:
+                self._index[p.name] = {"size": size, "atime": time.time()}
+                self._save_index()
+
+            # Evict if needed
+            self._evict_if_needed()
+
+        except Exception:
+            # fail silently (don't break training)
+            return
 
 # -----------------------------
 # Optimized Tiling
@@ -274,7 +414,8 @@ class HDRDatasetMaxPerf(data.Dataset):
                  tile_h=256, tile_w=256, stride_h=None, stride_w=None,
                  split=None, split_scenes=None,
                  max_cached_pairs=16, use_half=False, 
-                 num_load_threads=4, use_disk_cache=False, disk_cache_dir=None):
+                 num_load_threads=4, use_disk_cache=False, disk_cache_dir=None,
+                 disk_max_size_bytes=(5 * 1024 ** 3), summary_only=True):
         """
         Args:
             use_half: Store tiles in fp16 (50% memory reduction)
@@ -294,7 +435,13 @@ class HDRDatasetMaxPerf(data.Dataset):
         
         # Initialize components
         self.loader = ParallelImageLoader(num_load_threads)
-        self.disk_cache = DiskCacheManager(disk_cache_dir if use_disk_cache else None)
+        self.disk_cache = DiskCacheManager(
+            disk_cache_dir if use_disk_cache else None,
+            max_size_bytes=disk_max_size_bytes,   # set default to 5 GB, or pass via args
+            summary_only=summary_only,                # -> very small cache (only sums + tiny tiles)
+            downsample_factor=4,
+            use_half=self.use_half
+        )
         
         # Build pairs
         all_scenes = sorted(os.listdir(data_dir))
@@ -364,6 +511,15 @@ class HDRDatasetMaxPerf(data.Dataset):
         tile_params = (self.tile_h, self.tile_w, self.stride_h, self.stride_w)
         cached = self.disk_cache.load(pair_idx, tile_params)
         if cached is not None:
+            # convert to torch tensors and maintain dtype
+            for k, arr in cached.items():
+                # arr is a torch tensor already in our DiskCacheManager impl; but if numpy, do:
+                if isinstance(arr, np.ndarray):
+                    t = torch.from_numpy(arr)
+                else:
+                    t = arr
+                # if we used fp16 on disk and need fp32 for training, convert below when returning from __getitem__
+                cached[k] = t
             self._add_to_memory_cache(pair_idx, cached)
             return cached
         
