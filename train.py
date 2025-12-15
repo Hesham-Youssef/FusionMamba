@@ -375,6 +375,11 @@ def train(args, training_data_loader, validate_data_loader, train_set, validate_
                           f'Iter: {iteration}/{len(training_data_loader)} | '
                           f'Loss: {loss.item():.6f} | '
                           f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
+                    
+                if(iteration % 200 == 0):
+                    # Save final checkpoint
+                    save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
+                    print(f"\ncheckpointing at {iteration + epoch}!")
 
             # Epoch summary
             t_loss = np.nanmean(np.array(epoch_train_loss))
