@@ -439,8 +439,8 @@ if __name__ == "__main__":
                         help='Number of data loader workers')
 
     # DataLoader optimization features
-    # parser.add_argument('--use_half', action='store_true',
-    #                     help='Use fp16 storage for 50%% memory reduction')
+    parser.add_argument('--use_half', action='store_true',
+                        help='Use fp16 storage for 50%% memory reduction')
     parser.add_argument('--summary_only', type=bool, default=True)
     parser.add_argument('--disk_max_size_bytes', type=int, default=5 * (1024 ** 3))
     parser.add_argument('--num_load_threads', type=int, default=4,
