@@ -158,9 +158,7 @@ class U2Net(nn.Module):
             nn.LeakyReLU()
         )
  
-        self.output_scale = nn.Parameter(
-            (torch.ones(1, img2_dim, 1, 1) * 0.1).contiguous()
-        )
+        self.output_scale = nn.Parameter(torch.ones(1, img2_dim, 4, 4) * 0.1)
         
         skip_in_channels = img1_dim + img2_dim
         skip_mid = max(1, dim // 2)
