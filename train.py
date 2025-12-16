@@ -162,25 +162,9 @@ def prepare_training_data(args):
         disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
         summary_only=args.summary_only,
         disk_max_size_bytes=args.disk_max_size_bytes,
-        use_log=False
     )
-
-    validate_set = HDRDatasetMaxPerf(
-        data_dir=data_dir,
-        tile_h=tile_h, tile_w=tile_w,
-        stride_h=stride_h, stride_w=stride_w,
-        split='val',
-        split_scenes=val_scenes,
-        max_cached_pairs=args.max_cached_pairs,
-        # use_half=args.use_half,
-        num_load_threads=args.num_load_threads,
-        use_disk_cache=False,
-        use_log=False
-    )
-
 
     print(f"Training tiles: {len(train_set)}")
-    print(f"Validation tiles: {len(validate_set)}")
 
     print("Using smart sampler for better cache locality")
     train_sampler = train_set.get_smart_sampler(args.batch_size, shuffle=True)
@@ -193,22 +177,24 @@ def prepare_training_data(args):
         prefetch_factor=1 if args.num_workers > 0 else None
     )
     
-    # Validation typically doesn't need smart sampler but we can use it
-    val_sampler = validate_set.get_smart_sampler(args.batch_size, shuffle=False)
-    validate_data_loader = DataLoader(
-        dataset=validate_set,
-        batch_sampler=val_sampler,
-        num_workers=args.num_workers,
-        pin_memory=False,
-        persistent_workers=False if args.num_workers > 0 else False,
-        prefetch_factor=1 if args.num_workers > 0 else None
-    )
+    return training_data_loader, train_set
 
-    return training_data_loader, validate_data_loader, train_set, validate_set
+def reinhard_tonemap(hdr_image, eps=1e-8):
+    """
+    Apply Reinhard tone mapping to HDR image.
+    Args:
+        hdr_image: HDR image tensor in LINEAR space (B, C, H, W)
+        eps: small value to avoid division by zero
+    Returns:
+        Tone-mapped image in [0, 1] range
+    """
+    # Reinhard tone mapping: TM = L / (1 + L)
+    return hdr_image / (1.0 + hdr_image)
 
 
-def train(args, training_data_loader, validate_data_loader, train_set, validate_set):
-    """Main training loop."""
+def train(args, training_data_loader, train_set):
+    """Main training loop with fixed HDR loss."""
+
     # Initialize model
     model = Net(
         args.channels,
@@ -218,13 +204,13 @@ def train(args, training_data_loader, validate_data_loader, train_set, validate_
         args.W,
         args.ratio
     ).to(args.device)
-    
-    # Use all available GPUs
+
+    # Multi-GPU support
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
-    # Model expects all inputs to be the same size (tile_h x tile_w)
+    # Print model summary
     print("\nModel Architecture:")
     summary(
         model,
@@ -238,18 +224,12 @@ def train(args, training_data_loader, validate_data_loader, train_set, validate_
     )
 
     # Loss functions
-    if args.use_ergas:
-        criterion_l1 = nn.L1Loss().to(args.device)
-        criterion_ergas = ERGAS(args.ratio).to(args.device)
-    else:
-        criterion = nn.L1Loss().to(args.device)
+    criterion_hdr = nn.SmoothL1Loss(beta=0.1).to(args.device)
+    criterion_perceptual = nn.L1Loss().to(args.device)
 
-    # Optimizer and scheduler
-    start_epoch = 1
-    end_epoch = args.epoch
-    num_epochs_to_run = end_epoch - start_epoch + 1
-
+    # Optimizer and LR scheduler
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
+    num_epochs_to_run = args.epoch
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,
@@ -258,146 +238,121 @@ def train(args, training_data_loader, validate_data_loader, train_set, validate_
         anneal_strategy='cos'
     )
 
-    # Resume from checkpoint if provided
-    if args.resume_path is not None and os.path.isfile(args.resume_path):
+    # Resume from checkpoint
+    start_epoch = 1
+    if args.resume_path and os.path.isfile(args.resume_path):
         print(f"\nLoading checkpoint: {args.resume_path}")
         checkpoint = torch.load(args.resume_path, map_location=args.device)
-
         model.load_state_dict(checkpoint['model_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
-        lr_scheduler.load_state_dict(checkpoint['scheduler_state'])
-
         start_epoch = checkpoint['epoch'] + 1
-        end_epoch = start_epoch + num_epochs_to_run - 1
         print(f"Resumed training from epoch {start_epoch}")
 
-    print(f"\nTraining from epoch {start_epoch} to {end_epoch}")
+    print(f"\nTraining from epoch {start_epoch} to {args.epoch}")
     print("=" * 80)
+    
+    perceptual_weight = getattr(args, 'perceptual_weight', 0.25)
+    bias_weight = 0.02        # start small (0.01–0.05)
+    linear_weight = 1e-3      # optional but recommended
 
     t_start = time.time()
 
     try:
-        # Training loop
-        for epoch in range(start_epoch, end_epoch + 1):
+        for epoch in range(start_epoch, args.epoch + 1):
             model.train()
-            epoch_train_loss = []
-            epoch_train_loss_l1 = []
-            epoch_train_loss_ergas = []
+            epoch_loss = []
+            epoch_loss_perceptual = []
 
             for iteration, batch in enumerate(training_data_loader, 1):
-                gt, ldr1, ldr2, sum1, sum2 = (
-                    batch[0].to(args.device),
-                    batch[1].to(args.device),
-                    batch[2].to(args.device),
-                    batch[3].to(args.device),
-                    batch[4].to(args.device)
-                )
+                gt, ldr1, ldr2, sum1, sum2 = [x.to(args.device) for x in batch]
 
                 optimizer.zero_grad()
-                sr = model(ldr1, ldr2, sum1, sum2)
+                sr_log = model(ldr1, ldr2, sum1, sum2)
 
-                # Optional: Save first batch of first epoch for debugging
-                if args.save_debug and epoch == start_epoch and iteration == 1:
-                    save_batch_debug(gt, ldr1, ldr2, sr, epoch, iteration)
+                gt_safe = torch.clamp(gt, min=1e-4)
+                target_log = torch.log1p(gt_safe)
 
-                # Compute loss
-                if args.use_ergas:
-                    loss_l1 = criterion_l1(sr, gt)
-                    loss_ergas = criterion_ergas(sr, gt)
-                    loss = loss_l1 + args.ergas_hp * loss_ergas
-                    epoch_train_loss_l1.append(loss_l1.item())
-                    epoch_train_loss_ergas.append(loss_ergas.item())
-                else:
-                    loss = criterion(sr, gt)
+                # HDR loss (main)
+                loss_hdr = criterion_hdr(sr_log, target_log)
 
-                epoch_train_loss.append(loss.item())
+                # Bias anchoring (log-space mean)
+                mean_diff = (sr_log - target_log).mean()
+                loss_bias = torch.abs(mean_diff)
 
-                # Backward pass
+                # Optional: absolute scale stabilization (linear space)
+                sr_linear = torch.expm1(sr_log)
+                loss_linear = torch.nn.functional.l1_loss(sr_linear, gt_safe)
+
+                # Perceptual (tone-mapped)
+                sr_tm = reinhard_tonemap(sr_linear.detach())
+                gt_tm = reinhard_tonemap(gt)
+                loss_perceptual = criterion_perceptual(sr_tm, gt_tm)
+
+                # Total loss
+                loss = (
+                    loss_hdr
+                    + perceptual_weight * loss_perceptual
+                    + bias_weight * loss_bias
+                    + linear_weight * loss_linear
+                )
+                # Backward and optimize
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 lr_scheduler.step()
+                
+                # with torch.no_grad():
+                #     m = model.module if hasattr(model, 'module') else model
+                #     if hasattr(m, 'output_scale'):
+                #         m.output_scale.clamp_(0.0, 5.0)
 
-                # Print progress
+                epoch_loss.append(loss_hdr.item())
+                epoch_loss_perceptual.append(loss_perceptual.item())
+                with torch.no_grad():
+                    log_bias_val = mean_diff.item()
+                    sr_mean = sr_linear.mean().item()
+                    gt_mean = gt_safe.mean().item()
+                    scale_ratio = sr_mean / (gt_mean + 1e-6)
+                # Progress printing
                 if iteration % args.print_freq == 0:
-                    print(f'Epoch: {epoch}/{end_epoch} | '
-                          f'Iter: {iteration}/{len(training_data_loader)} | '
-                          f'Loss: {loss.item():.6f} | '
-                          f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
-                    
-                if(iteration % 200 == 0):
-                    # Save final checkpoint
+                    print(
+                        f'Epoch {epoch}/{args.epoch} | '
+                        f'Iter {iteration}/{len(training_data_loader)} | '
+                        f'HDR: {loss_hdr.item():.5f} | '
+                        f'Perc: {loss_perceptual.item():.5f} | '
+                        f'Bias: {loss_bias.item():.4f} | '
+                        f'LogΔ: {log_bias_val:+.3f} | '
+                        f'Scale×: {scale_ratio:.2f} | '
+                        f'LR: {optimizer.param_groups[0]["lr"]:.2e}'
+                    )
+
+                # Checkpoint every 200 iterations
+                if iteration % 200 == 0:
                     save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
-                    print(f"\ncheckpointing at {iteration + epoch}!")
+                    print(f"\nCheckpoint saved at iteration {iteration + epoch}!")
 
             # Epoch summary
-            t_loss = np.nanmean(np.array(epoch_train_loss))
-            if args.use_ergas:
-                print(f'\nEpoch {epoch}/{end_epoch} Training Summary:')
-                print(f'  Total Loss: {t_loss:.6f}')
-                print(f'  L1 Loss: {np.nanmean(np.array(epoch_train_loss_l1)):.6f}')
-                print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_train_loss_ergas)):.6f}')
-            else:
-                print(f'\nEpoch {epoch}/{end_epoch} Training Loss: {t_loss:.6f}')
+            print(f'\nEpoch {epoch} Summary:')
+            print(f'  HDR Loss: {np.nanmean(epoch_loss):.6f}')
+            print(f'  Perceptual Loss: {np.nanmean(epoch_loss_perceptual):.6f}')
 
-            # Validation
-            if epoch % args.val_freq == 0:
-                model.eval()
-                epoch_val_loss = []
-                epoch_val_loss_l1 = []
-                epoch_val_loss_ergas = []
+            print(f'\n{"="*80}')
+            print(f'Time elapsed: {time.time() - t_start:.2f}s')
+            print(f'{"="*80}\n')
+            t_start = time.time()
 
-                with torch.no_grad():
-                    for iteration, batch in enumerate(validate_data_loader, 1):
-                        gt, ldr1, ldr2, sum1, sum2 = (
-                            batch[0].to(args.device),
-                            batch[1].to(args.device),
-                            batch[2].to(args.device),
-                            batch[3].to(args.device),
-                            batch[4].to(args.device)
-                        )
-
-                        sr = model(ldr1, ldr2, sum1, sum2)
-
-                        if args.use_ergas:
-                            loss_l1 = criterion_l1(sr, gt)
-                            loss_ergas = criterion_ergas(sr, gt)
-                            loss = loss_l1 + args.ergas_hp * loss_ergas
-                            epoch_val_loss_l1.append(loss_l1.item())
-                            epoch_val_loss_ergas.append(loss_ergas.item())
-                        else:
-                            loss = criterion(sr, gt)
-
-                        epoch_val_loss.append(loss.item())
-
-                v_loss = np.nanmean(np.array(epoch_val_loss))
-                t_end = time.time()
-
-                print(f'\n{"="*80}')
-                print(f'Validation Results:')
-                if args.use_ergas:
-                    print(f'  Total Loss: {v_loss:.6f}')
-                    print(f'  L1 Loss: {np.nanmean(np.array(epoch_val_loss_l1)):.6f}')
-                    print(f'  ERGAS Loss: {np.nanmean(np.array(epoch_val_loss_ergas)):.6f}')
-                else:
-                    print(f'  Loss: {v_loss:.6f}')
-                print(f'Time elapsed: {(t_end - t_start):.2f}s')
-                print(f'{"="*80}\n')
-
-                t_start = time.time()
-
-            # Save checkpoint
+            # Epoch checkpoint
             if epoch % args.ckpt == 0:
                 save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
 
-        # Save final checkpoint
-        save_checkpoint(args, model, optimizer, lr_scheduler, end_epoch)
+        # Final checkpoint
+        save_checkpoint(args, model, optimizer, lr_scheduler, args.epoch)
         print("\nTraining completed!")
-        
+
     finally:
-        # Cleanup datasets
-        print("\nCleaning up resources...")
+        # Cleanup
+        print("\nCleaning up datasets...")
         train_set.cleanup()
-        validate_set.cleanup()
         print("Cleanup completed.")
 
 
@@ -423,8 +378,6 @@ if __name__ == "__main__":
                         help='Number of spectral channels')
 
     # Loss function
-    parser.add_argument('--use_ergas', action='store_true',
-                        help='Use ERGAS loss in addition to L1 loss')
     parser.add_argument('--ergas_hp', type=float, default=1e-4,
                         help='Weight for ERGAS loss')
 
@@ -499,10 +452,7 @@ if __name__ == "__main__":
     print(f"  Batch size: {args.batch_size}")
     print(f"  Epochs: {args.epoch}")
     print(f"  Learning rate: {args.lr}")
-    print(f"  Use ERGAS: {args.use_ergas}")
-    if args.use_ergas:
-        print(f"  ERGAS weight: {args.ergas_hp}")
     print("="*80)
 
-    training_data_loader, validate_data_loader, train_set, validate_set = prepare_training_data(args)
-    train(args, training_data_loader, validate_data_loader, train_set, validate_set)
+    training_data_loader, train_set = prepare_training_data(args)
+    train(args, training_data_loader, train_set)

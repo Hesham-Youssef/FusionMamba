@@ -546,7 +546,7 @@ class SmartBatchSampler(data.Sampler):
 class HDRDatasetMaxPerf(data.Dataset):
     """Ultimate optimized dataset with all performance features."""
     
-    def __init__(self, data_dir, use_log=True, transform=None,
+    def __init__(self, data_dir, transform=None,
                  tile_h=256, tile_w=256, stride_h=None, stride_w=None,
                  split=None, split_scenes=None,
                  max_cached_pairs=16, use_half=False, 
@@ -560,7 +560,6 @@ class HDRDatasetMaxPerf(data.Dataset):
             disk_cache_dir: Directory for disk cache
         """
         self.data_dir = data_dir
-        self.use_log = use_log
         self.transform = transform
         self.tile_h = tile_h
         self.tile_w = tile_w
@@ -683,9 +682,6 @@ class HDRDatasetMaxPerf(data.Dataset):
         t1 = _to_tensor_fast(ldr1, False, self.use_half)
         t2 = _to_tensor_fast(ldr2, False, self.use_half)
         tg = _to_tensor_fast(hdr, True, self.use_half)
-        
-        if self.use_log:
-            tg = torch.log1p(torch.clamp(tg, min=0))
         
         if self.transform:
             tg, t1, t2 = self.transform(tg, t1, t2)

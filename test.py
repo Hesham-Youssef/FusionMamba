@@ -142,68 +142,6 @@ def compute_summary_efficient(ldr1, ldr2, tile_h, tile_w, stride_h, stride_w, de
     return sum1, sum2
 
 
-# Original methods for verification
-def extract_tiles_old(img, tile_h, tile_w, stride_h, stride_w, pad_mode='reflect'):
-    """Original tile extraction that returns all tiles as a list"""
-    C, H, W = img.shape
-    
-    if H <= tile_h:
-        pad_top, pad_bottom = 0, tile_h - H
-    else:
-        n_steps_h = math.ceil((H - tile_h) / float(stride_h)) + 1
-        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
-        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
-
-    if W <= tile_w:
-        pad_left, pad_right = 0, tile_w - W
-    else:
-        n_steps_w = math.ceil((W - tile_w) / float(stride_w)) + 1
-        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
-        pad_left, pad_right = 0, max(0, full_covered_w - W)
-
-    if any(x > 0 for x in (pad_top, pad_bottom, pad_left, pad_right)):
-        img_p = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
-    else:
-        img_p = img
-
-    _, Hp, Wp = img_p.shape
-    tiles, coords = [], []
-    for y in range(0, Hp - tile_h + 1, stride_h):
-        for x in range(0, Wp - tile_w + 1, stride_w):
-            tile = img_p[:, y:y + tile_h, x:x + tile_w]
-            y0 = max(0, y - pad_top)
-            x0 = max(0, x - pad_left)
-            y1 = min(H, y - pad_top + tile_h)
-            x1 = min(W, x - pad_left + tile_w)
-            tiles.append(tile)
-            coords.append((y0, y1, x0, x1))
-    return tiles, coords, (H, W), (pad_top, pad_bottom, pad_left, pad_right)
-
-
-def compute_summary_old(ldr1, ldr2, tiles1, tiles2, coords, orig_shape, tile_h, tile_w, device):
-    """Original summary computation"""
-    H, W = orig_shape
-    dtype = ldr1.dtype
-    win = make_hann_window(tile_h, tile_w, device=device, dtype=dtype)
-
-    def merge(tiles, base):
-        out = torch.zeros_like(base)
-        wgt = torch.zeros((1, H, W), dtype=base.dtype, device=device)
-        for tile, (y0, y1, x0, x1) in zip(tiles, coords):
-            vh, vw = y1 - y0, x1 - x0
-            ws = win[:vh, :vw].unsqueeze(0)
-            out[:, y0:y1, x0:x1] += tile[:, :vh, :vw] * ws
-            wgt[:, y0:y1, x0:x1] += ws
-        return out / (wgt + 1e-8)
-
-    s1 = merge(tiles1, ldr1)
-    s2 = merge(tiles2, ldr2)
-
-    s1_pool = F.adaptive_avg_pool2d(s1.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
-    s2_pool = F.adaptive_avg_pool2d(s2.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
-    return s1_pool, s2_pool
-
-
 def compute_metrics(sr, gt):
     from pytorch_msssim import ssim
     sr = sr.clamp(0, 1)
@@ -291,34 +229,9 @@ def test(args):
         cut = args.cut_size
         stride = cut // 2
 
-        if args.verify_summaries:
-            # Use original method for verification
-            print("  [VERIFY] Computing summaries with original method...")
-            tiles1_list, coords, orig_shape, _ = extract_tiles_old(t1, cut, cut, stride, stride)
-            tiles2_list, _, _, _ = extract_tiles_old(t2, cut, cut, stride, stride)
-            sum1_orig, sum2_orig = compute_summary_old(
-                t1, t2, tiles1_list, tiles2_list, coords, orig_shape, cut, cut, args.device
-            )
-            
-            print("  [VERIFY] Computing summaries with optimized method...")
-            sum1_opt, sum2_opt = compute_summary_efficient(
-                t1, t2, cut, cut, stride, stride, args.device
-            )
-            
-            diff1 = (sum1_orig - sum1_opt).abs().mean()
-            diff2 = (sum2_orig - sum2_opt).abs().mean()
-            print(f"  [VERIFY] Summary difference: sum1={diff1:.6f}, sum2={diff2:.6f}")
-            
-            if diff1 > 1e-5 or diff2 > 1e-5:
-                print("  [WARNING] Summaries differ! Using original method.")
-                sum1, sum2 = sum1_orig, sum2_orig
-            else:
-                print("  [OK] Summaries match. Using optimized method.")
-                sum1, sum2 = sum1_opt, sum2_opt
-        else:
-            sum1, sum2 = compute_summary_efficient(
-                t1, t2, cut, cut, stride, stride, args.device
-            )
+        sum1, sum2 = compute_summary_efficient(
+            t1, t2, cut, cut, stride, stride, args.device
+        )
         
         # Prepare for tiled inference
         pad = args.pad
@@ -410,13 +323,8 @@ def test(args):
                 if args.save_debug and batch_start == 0:
                     raw_outputs_sample.append(sr_batch[0].detach().clone())
                 
-                # DON'T clamp here if using log-space! Let values exceed 1.0
-                if args.use_log:
-                    # In log space, values can exceed 1.0 (log(1+large_HDR) > 1)
-                    sr_batch = sr_batch.float().clamp(min=0)  # Only clamp negative values
-                else:
-                    # In linear space, clamp to [0, 1]
-                    sr_batch = sr_batch.float().clamp(0, 1)
+                # In linear space, clamp to [0, 1]
+                sr_batch = sr_batch.float().clamp(0, 1)
                 
                 # Accumulate results
                 for i, (y, x) in enumerate(batch_tiles):
@@ -458,8 +366,6 @@ def test(args):
             print(f'     Values > 1.0: {(out_final > 1.0).sum().item()} pixels')
             print(f'     Values > 0.5: {(out_final > 0.5).sum().item()} pixels')
 
-        if args.use_log:
-            output_np = np.expm1(output_np)
         output_np = np.clip(output_np, 0, None)  # Only clip negatives, allow large HDR values
 
         # Save HDR
@@ -626,8 +532,6 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, required=True)
     parser.add_argument('--weight', type=str, required=True)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--use_log', action='store_true', default=True,
-                        help='Apply log-space inverse transform (disable if colors look wrong)')
     parser.add_argument('--batch_size', type=int, default=8, 
                         help='Number of tiles to process in parallel (increase for speed, decrease for memory)')
     parser.add_argument('--use_amp', action='store_true', 
