@@ -199,6 +199,8 @@ class U2Net(nn.Module):
         # enforce positivity & learned scale for linear radiance (softplus + small scale)
         # keep a small init for output_scale in __init__ like: self.output_scale = nn.Parameter(torch.ones(1,img2_dim,1,1)*0.1)
         # safe_scale = torch.clamp(self.output_scale, max=10.0)  # avoid runaway amplification
+        
+        linear = output
         # linear = F.softplus(output) * self.output_scale + 1e-6       # (B, C, H, W), > 0
 
         # spectral attention: average and clamp so it doesn't amplify >1

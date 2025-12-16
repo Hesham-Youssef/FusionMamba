@@ -211,17 +211,17 @@ def train(args, training_data_loader, train_set):
         model = nn.DataParallel(model)
 
     # Print model summary
-    # print("\nModel Architecture:")
-    # summary(
-    #     model,
-    #     input_size=[
-    #         (args.batch_size, 3, args.H, args.W),  # ldr1
-    #         (args.batch_size, 3, args.H, args.W),  # ldr2
-    #         (args.batch_size, 3, args.H, args.W),  # sum1
-    #         (args.batch_size, 3, args.H, args.W)   # sum2
-    #     ],
-    #     dtypes=[torch.float, torch.float, torch.float, torch.float]
-    # )
+    print("\nModel Architecture:")
+    summary(
+        model,
+        input_size=[
+            (args.batch_size, 3, args.H, args.W),  # ldr1
+            (args.batch_size, 3, args.H, args.W),  # ldr2
+            (args.batch_size, 3, args.H, args.W),  # sum1
+            (args.batch_size, 3, args.H, args.W)   # sum2
+        ],
+        dtypes=[torch.float, torch.float, torch.float, torch.float]
+    )
 
     # Loss functions
     criterion_hdr = nn.SmoothL1Loss(beta=0.1).to(args.device)
