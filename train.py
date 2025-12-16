@@ -162,7 +162,7 @@ def prepare_training_data(args):
         disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
         summary_only=args.summary_only,
         disk_max_size_bytes=args.disk_max_size_bytes,
-        use_log=True
+        use_log=False
     )
 
     validate_set = HDRDatasetMaxPerf(
@@ -175,7 +175,7 @@ def prepare_training_data(args):
         # use_half=args.use_half,
         num_load_threads=args.num_load_threads,
         use_disk_cache=False,
-        use_log=True
+        use_log=False
     )
 
 
