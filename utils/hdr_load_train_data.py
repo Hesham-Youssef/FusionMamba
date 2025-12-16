@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 import torch.utils.data as data
 
+import imageio.v2 as imageio
+
 
 # -----------------------------
 # Configuration
@@ -36,26 +38,39 @@ class Config:
 # -----------------------------
 
 def _to_tensor_fast(image_np, is_hdr=False, use_half=False):
-    """Optimized tensor conversion with optional fp16."""
-    # Avoid extra copy by checking dtype first
-    if image_np.dtype != np.float32:
-        img = image_np.astype(np.float32)
-    else:
-        img = image_np
-    
-    if not is_hdr and img.max() > 1.5:
-        img = img * (1.0 / 255.0)  # Slightly faster than division
-    
+    """Optimized tensor conversion with safer HDR/LDR handling."""
+    # ensure numpy array
+    img = image_np
+
+    # If image is integer type, convert to float32 first
+    if img.dtype == np.uint8:
+        img = img.astype(np.float32)
+        # interpret uint8 as 0..255 LDR
+        if not is_hdr:
+            img = img * (1.0 / 255.0)
+    elif img.dtype == np.uint16:
+        # uint16 often means 0..65535 (tiff) — try to preserve radiance if HDR flagged
+        img = img.astype(np.float32)
+        if not is_hdr:
+            img = img * (1.0 / 65535.0)
+        # if is_hdr, we *preserve* raw float values (user should confirm)
+    elif img.dtype != np.float32:
+        img = img.astype(np.float32)
+
+    # If it's marked as HDR but values look tiny (<=1), warn (helps debug)
+    if is_hdr:
+        mx = float(img.max()) if hasattr(img, "max") else None
+        if mx is not None and mx <= 1.5:
+            # this is suspicious for HDR radiance — leave it but warn
+            print(f"WARNING: loaded HDR image has max {mx:.4f} (<=1.5). Are files normalized?")
+
     if img.ndim == 2:
         img = img[:, :, None]
-    
-    # Direct memory view when possible
+
     tensor = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
-    
     if use_half:
         return tensor.half()
     return tensor.float()
-
 
 @lru_cache(maxsize=64)
 def make_hann_window(h, w, device_str='cpu', use_half=False):
@@ -69,15 +84,25 @@ def make_hann_window(h, w, device_str='cpu', use_half=False):
 
 
 def load_image_fast(path):
-    """Fast image loading with BGR to RGB."""
+    """Fast image loading with correct HDR handling."""
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".hdr":
+        # imageio preserves Radiance HDR radiance correctly
+        img = imageio.imread(path).astype(np.float32)
+
+        # imageio returns RGB already
+        return img
+
+    # LDR path (OpenCV is fine here)
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f"Failed to read {path}")
-    # Vectorized color conversion
-    if img.ndim == 3 and img.shape[2] == 3:
-        return img[:, :, ::-1].copy()  # BGR to RGB via slicing
-    return img
 
+    if img.ndim == 3 and img.shape[2] == 3:
+        return img[:, :, ::-1].copy()  # BGR → RGB
+
+    return img
 
 # -----------------------------
 # Parallel Image Loader
@@ -477,28 +502,34 @@ def extract_tiles_optimized(img, tile_h, tile_w, stride_h, stride_w, pad_mode='r
 
 
 def compute_summary_fast(ldr, tiles, coords, orig_shape, tile_h, tile_w, use_half=False):
-    """Optimized summary with minimal allocations."""
+    """Optimized summary with minimal allocations (fixed)."""
+    # orig_shape is (H, W)
     H, W = orig_shape
-    C, device, dtype = ldr.shape[0], ldr.device, ldr.dtype
-    
+    C = int(ldr.shape[0])
+    device = ldr.device
+    dtype = ldr.dtype
+
     # Reuse buffers
     merged = torch.zeros((C, H, W), dtype=dtype, device=device)
     weights = torch.zeros((1, H, W), dtype=dtype, device=device)
-    window = make_hann_window(tile_h, tile_w, str(device), use_half)
-    
+
+    # Ensure make_hann_window gets stable args (device as string)
+    window = make_hann_window(tile_h, tile_w, device_str=str(device), use_half=use_half)
+
     # Batch process tiles when possible
     for idx, (y0, y1, x0, x1) in enumerate(coords):
         vh, vw = y1 - y0, x1 - x0
-        w = window[:vh, :vw].unsqueeze(0)
-        # In-place operations
-        merged[:, y0:y1, x0:x1].add_(tiles[idx, :, :vh, :vw].mul(w))
+        w = window[:vh, :vw].unsqueeze(0)   # (1, vh, vw)
+        # In-place operations: tiles[idx] has shape (C, tile_h, tile_w)
+        patch = tiles[idx, :, :vh, :vw]
+        merged[:, y0:y1, x0:x1].add_(patch.mul(w))
         weights[:, y0:y1, x0:x1].add_(w)
-    
-    merged.div_(weights.clamp_(min=1e-8))
-    
-    # Fast downsampling
-    return F.adaptive_avg_pool2d(merged.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
 
+    # normalize (avoid division by zero)
+    merged.div_(weights.clamp(min=1e-8))
+
+    # Fast downsampling -> return same shape as tile (C, tile_h, tile_w)
+    return F.adaptive_avg_pool2d(merged.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
 
 # -----------------------------
 # Smart Sampler - groups tiles from same pair

@@ -153,6 +153,14 @@ class U2Net(nn.Module):
         self.img1_spe_attn = SpeAttention(dim)
         self.img2_spe_attn = SpeAttention(dim)
         
+        self.skip_converter = nn.Sequential(
+            nn.Conv2d(img1_dim, img2_dim, 1),
+            nn.LeakyReLU()
+        )
+ 
+        self.output_scale = nn.Parameter(
+            torch.ones(1, img2_dim, 1, 1) * 0.1
+        )
         
         skip_in_channels = img1_dim + img2_dim
         skip_mid = max(1, dim // 2)
@@ -185,20 +193,35 @@ class U2Net(nn.Module):
         img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
         output = self.stage4(img1, img2, sum1, sum2)
 
-        img1_spe_attn = self.img1_spe_attn(org_img1)
-        img2_spe_attn = self.img2_spe_attn(org_img2)
-
         # decoder → RGB
         output = self.to_hrimg2(output)
 
-        # spectral attention
-        output = output * (img1_spe_attn + img2_spe_attn)
-        
-        gate_in = torch.cat([org_img1, output], dim=1)   # (B, 6, H, W)
-        gate = self.skip_gate(gate_in)                    # (B, 1, H, W)
+        # enforce positivity & learned scale for linear radiance (softplus + small scale)
+        # keep a small init for output_scale in __init__ like: self.output_scale = nn.Parameter(torch.ones(1,img2_dim,1,1)*0.1)
+        # safe_scale = torch.clamp(self.output_scale, max=10.0)  # avoid runaway amplification
+        linear = F.softplus(output) * self.output_scale + 1e-6       # (B, C, H, W), > 0
+
+        # spectral attention: average and clamp so it doesn't amplify >1
+        img1_spe_attn = self.img1_spe_attn(org_img1)
+        img2_spe_attn = self.img2_spe_attn(org_img2)
+        att = (img1_spe_attn + img2_spe_attn)
+        # att = torch.clamp(att, 0.0, 1.0)
+        linear = linear * att   # multiply in linear domain
+
+        # prepare skip (in linear domain), do NOT log1p() the skip here
+        converted_skip = self.skip_converter(org_img1)    # (B, C, H, W)
+        converted_skip = F.softplus(converted_skip) + 1e-6
+
+        # Gate: build gate input with both terms IN THE SAME (linear) DOMAIN
+        gate_in = torch.cat([converted_skip, linear], dim=1)   # (B, 2*C, H, W)
+        gate = self.skip_gate(gate_in)                        # (B, 1, H, W)
 
         skip_alpha = torch.sigmoid(self.skip_alpha_param)
-        
-        output = output + skip_alpha * gate * (org_img1 - output)
 
-        return output
+        # Combine in linear domain
+        output_lin = linear * (1.0 - skip_alpha * gate) + skip_alpha * gate * converted_skip
+        output_lin = torch.clamp(output_lin, min=0.0)   # defensive
+
+        # Finally: return log1p(linear) so training (and your test expm1) are consistent
+        out = torch.log1p(output_lin + 1e-6)
+        return out

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# tester_tiled_optimized.py
+# tester_tiled_optimized_FIXED.py
 """
-Optimized patch-based tiled tester with:
- - Batch processing for speed
- - Lazy tile generation for memory efficiency
- - Mixed precision support
- - Efficient summary computation
+FIXED version with correct HDR handling:
+1. Use imageio for HDR loading (matches training)
+2. Remove premature clamping of model output
+3. Apply proper inverse transformation (expm1)
 """
 
 import os
@@ -18,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
+import imageio.v2 as imageio  # FIXED: Use imageio for HDR
 
 # --- Utilities ---
 def _to_tensor_and_normalize(image_np, is_hdr=False):
@@ -180,12 +180,12 @@ def test(args):
     # Enable mixed precision if requested
     use_amp = args.use_amp and args.device == 'cuda'
     if use_amp:
-        print("WARNING: Using automatic mixed precision (AMP) - disable with --no-use_amp if results are poor")
+        print("Using automatic mixed precision (AMP)")
     
     if args.batch_size > 1:
         print(f"Using batch processing with batch_size={args.batch_size}")
     else:
-        print("Using single-tile processing (slower but safer)")
+        print("Using single-tile processing")
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -208,16 +208,17 @@ def test(args):
         if len(ldr_files) < 2 or len(hdr_files) == 0:
             continue
 
-        # Read images
+        # Read LDR images with OpenCV (fine for LDR)
         ldr_long = cv2.imread(os.path.join(scene_path, ldr_files[0]), -1).astype(np.float32) / 255.0
         ldr_short = cv2.imread(os.path.join(scene_path, ldr_files[1]), -1).astype(np.float32) / 255.0
-        gt_hdr = cv2.imread(os.path.join(scene_path, hdr_files[0]), -1).astype(np.float32)
+        
+        # FIXED: Use imageio for HDR (matches training loader)
+        gt_hdr = imageio.imread(os.path.join(scene_path, hdr_files[0])).astype(np.float32)
 
         if ldr_long.ndim == 3:
             ldr_long = cv2.cvtColor(ldr_long, cv2.COLOR_BGR2RGB)
             ldr_short = cv2.cvtColor(ldr_short, cv2.COLOR_BGR2RGB)
-        if gt_hdr.ndim == 3:
-            gt_hdr = cv2.cvtColor(gt_hdr, cv2.COLOR_BGR2RGB)
+        # gt_hdr already in RGB from imageio
 
         # To tensors
         t1 = _to_tensor_and_normalize(ldr_long).to(args.device)
@@ -225,7 +226,7 @@ def test(args):
 
         H, W = t1.shape[1], t1.shape[2]
 
-        # Compute summaries efficiently
+        # Compute summaries
         cut = args.cut_size
         stride = cut // 2
 
@@ -279,7 +280,7 @@ def test(args):
         # Batch processing
         batch_size = args.batch_size
         
-        # Track raw model outputs before any processing
+        # Track raw model outputs
         if args.save_debug:
             raw_outputs_sample = []
         
@@ -319,12 +320,19 @@ def test(args):
                 with autocast_context:
                     sr_batch = model(MS_batch, PAN_batch, sum1_batch, sum2_batch)
                 
-                # CRITICAL: Save raw model output BEFORE any clipping/processing
+                # CRITICAL: Save raw model output BEFORE any transformation
                 if args.save_debug and batch_start == 0:
                     raw_outputs_sample.append(sr_batch[0].detach().clone())
                 
-                # In linear space, clamp to [0, 1]
-                sr_batch = sr_batch.float().clamp(0, 1)
+                # FIXED: Convert to float32 and apply inverse transformation
+                sr_batch = sr_batch.float()
+                
+                # FIXED: Apply inverse log transformation (expm1 = exp(x) - 1)
+                # This converts from log space back to linear HDR space
+                sr_batch = torch.expm1(sr_batch)
+                
+                # FIXED: Only clip negative values (allow large HDR values)
+                # sr_batch = sr_batch.clamp(min=0)
                 
                 # Accumulate results
                 for i, (y, x) in enumerate(batch_tiles):
@@ -344,67 +352,40 @@ def test(args):
         output_np = out_final.squeeze(0).permute(1, 2, 0).cpu().numpy()
         
         # ============================================================
-        # DIAGNOSTIC: Analyze where clipping happens
+        # DIAGNOSTIC: Analyze processing pipeline
         # ============================================================
         if args.save_debug:
-            print(f'\n  [DIAGNOSTIC] Clipping Analysis for Sample {idx+1}:')
+            print(f'\n  [DIAGNOSTIC] Processing Analysis for Sample {idx+1}:')
             print(f'  {"="*60}')
             
             # 1. Raw model output (first tile, before any processing)
             if raw_outputs_sample:
                 raw_first = raw_outputs_sample[0].cpu().numpy()
-                print(f'  1. Raw model output (first tile):')
+                print(f'  1. Raw model output (first tile, log space):')
                 print(f'     Range: [{raw_first.min():.4f}, {raw_first.max():.4f}]')
                 print(f'     Mean: {raw_first.mean():.4f}, Std: {raw_first.std():.4f}')
-                print(f'     Values > 1.0: {(raw_first > 1.0).sum()} pixels')
-                print(f'     Values > 0.5: {(raw_first > 0.5).sum()} pixels')
             
-            # 2. After merging but before log inverse
-            print(f'  2. After tile merging (before expm1):')
+            # 2. After expm1 transformation
+            print(f'  2. After expm1 (linear HDR space):')
             print(f'     Range: [{out_final.min().item():.4f}, {out_final.max().item():.4f}]')
             print(f'     Mean: {out_final.mean().item():.4f}')
-            print(f'     Values > 1.0: {(out_final > 1.0).sum().item()} pixels')
-            print(f'     Values > 0.5: {(out_final > 0.5).sum().item()} pixels')
-
-        output_np = np.clip(output_np, 0, None)  # Only clip negatives, allow large HDR values
-
-        # Save HDR
-        cv2.imwrite(
-            os.path.join(args.save_dir, f'output_{idx+1}.hdr'),
-            output_np[..., ::-1].astype(np.float32)
-        )
-        
-        # Print HDR statistics for debugging
-        if args.save_debug:
-            print(f'  3. After expm1 (final HDR):')
-            print(f'     Range: [{output_np.min():.4f}, {output_np.max():.4f}]')
-            print(f'     Mean: {output_np.mean():.4f}')
-            print(f'     Values > 1.0: {(output_np > 1.0).sum()} pixels')
-            print(f'     Values > 0.5: {(output_np > 0.5).sum()} pixels')
-            print(f'  4. Ground truth HDR:')
+            
+            # 3. Ground truth HDR
+            print(f'  3. Ground truth HDR:')
             print(f'     Range: [{gt_hdr.min():.4f}, {gt_hdr.max():.4f}]')
             print(f'     Mean: {gt_hdr.mean():.4f}')
-            print(f'     Values > 1.0: {(gt_hdr > 1.0).sum()} pixels')
-            print(f'     Values > 0.5: {(gt_hdr > 0.5).sum()} pixels')
-            
-            # Check if model architecture has clipping
-            print(f'\n  [ANALYSIS] Likely cause of clipping:')
-            if raw_outputs_sample and raw_first.max() < 0.45:
-                print(f'     ⚠️  MODEL ARCHITECTURE ISSUE: Raw output max={raw_first.max():.4f}')
-                print(f'     The model itself is not predicting high values!')
-                print(f'     Check: activation functions (sigmoid/tanh), training data range')
-            elif raw_outputs_sample and raw_first.max() > 0.9:
-                print(f'     ✓ Model outputs high values (max={raw_first.max():.4f})')
-                if out_final.max().item() < 0.45:
-                    print(f'     ⚠️  TESTING ROUTINE ISSUE: Values clipped during merging')
-                else:
-                    print(f'     ✓ Testing routine preserves high values')
-            else:
-                print(f'     → Model outputs moderate values (max={raw_first.max() if raw_outputs_sample else "N/A"})')
             print(f'  {"="*60}\n')
 
+        output_np = np.clip(output_np, 0, None)  # Only clip negatives
+
+        # Save HDR (use imageio to match training)
+        imageio.imwrite(
+            os.path.join(args.save_dir, f'output_{idx+1}.hdr'),
+            output_np.astype(np.float32)
+        )
+
         # ============================================================
-        # METRICS: Use original tone mapping (Reinhard, no exposure adjustment)
+        # METRICS: Use tone mapping for fair comparison
         # ============================================================
         sr_tm_for_metrics = output_np / (1.0 + output_np)
         sr_tm_for_metrics = np.clip(sr_tm_for_metrics, 0, 1)
@@ -418,7 +399,7 @@ def test(args):
         ssim_val, psnr_val = compute_metrics(sr_tm_tensor, gt_tm_tensor)
         
         # ============================================================
-        # VISUALIZATION: Apply exposure and better tone mapping for PNG
+        # VISUALIZATION: Apply exposure and tone mapping for PNG
         # ============================================================
         if args.auto_exposure:
             percentile_val = np.percentile(output_np, 95)
@@ -466,9 +447,9 @@ def test(args):
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
             
-            # Row 1: Comparison for metrics (original tone mapping)
+            # Row 1: Comparison for metrics
             axes[0, 0].imshow(sr_tm_for_metrics)
-            axes[0, 0].set_title(f'Output (Reinhard TM for metrics)\nSSIM={ssim_val:.4f}')
+            axes[0, 0].set_title(f'Output (Reinhard TM)\nSSIM={ssim_val:.4f}')
             axes[0, 0].axis('off')
             
             axes[0, 1].imshow(gt_tm_for_metrics)
@@ -477,23 +458,24 @@ def test(args):
             
             diff_metrics = np.abs(sr_tm_for_metrics - gt_tm_for_metrics)
             axes[0, 2].imshow(diff_metrics)
-            axes[0, 2].set_title(f'Difference (for metrics)\nMean: {diff_metrics.mean():.4f}')
+            axes[0, 2].set_title(f'Difference\nMean: {diff_metrics.mean():.4f}')
             axes[0, 2].axis('off')
             
-            # Row 2: Visualization with exposure adjustment
+            # Row 2: Visualization and analysis
             axes[1, 0].imshow(tm)
-            axes[1, 0].set_title(f'Output (exposure-adjusted for display)\n{args.tonemap_method.upper()} TM')
+            axes[1, 0].set_title(f'Output (exposure-adjusted)\n{args.tonemap_method.upper()} TM')
             axes[1, 0].axis('off')
             
-            # Histograms
+            # HDR histograms (log scale)
             axes[1, 1].hist(output_np.flatten(), bins=100, color='blue', alpha=0.7, label='Output HDR')
             axes[1, 1].hist(gt_hdr.flatten(), bins=100, color='green', alpha=0.5, label='GT HDR')
             axes[1, 1].set_title('HDR Value Distribution')
             axes[1, 1].set_xlabel('HDR Value')
-            axes[1, 1].set_ylabel('Count')
+            axes[1, 1].set_ylabel('Count (log scale)')
             axes[1, 1].set_yscale('log')
             axes[1, 1].legend()
             
+            # Tone-mapped histograms
             axes[1, 2].hist(sr_tm_for_metrics.flatten(), bins=100, color='blue', alpha=0.7, label='Output TM')
             axes[1, 2].hist(gt_tm_for_metrics.flatten(), bins=100, color='green', alpha=0.5, label='GT TM')
             axes[1, 2].set_title('Tone-Mapped Value Distribution')
@@ -508,8 +490,6 @@ def test(args):
             # Print statistics
             print(f'  Output HDR range: [{output_np.min():.4f}, {output_np.max():.4f}], mean: {output_np.mean():.4f}')
             print(f'  GT HDR range: [{gt_hdr.min():.4f}, {gt_hdr.max():.4f}], mean: {gt_hdr.mean():.4f}')
-            print(f'  Output TM (metrics) mean: {sr_tm_for_metrics.mean():.4f}')
-            print(f'  GT TM (metrics) mean: {gt_tm_for_metrics.mean():.4f}')
         
         # Clear scene data from GPU
         del t1, t2, sum1, sum2, ldr_long_t, ldr_short_t
@@ -532,29 +512,17 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, required=True)
     parser.add_argument('--weight', type=str, required=True)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--batch_size', type=int, default=8, 
-                        help='Number of tiles to process in parallel (increase for speed, decrease for memory)')
-    parser.add_argument('--use_amp', action='store_true', 
-                        help='Use automatic mixed precision for faster inference')
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--use_amp', action='store_true')
     parser.add_argument('--tonemap_method', type=str, default='aces',
-                        choices=['reinhard', 'gamma', 'log', 'simple', 'aces'],
-                        help='Tone mapping method for visualization (aces recommended for natural colors)')
-    parser.add_argument('--exposure', type=float, default=1.0,
-                        help='Manual exposure multiplier (try 2.0-5.0 if image is dark)')
-    parser.add_argument('--auto_exposure', action='store_true', default=True,
-                        help='Automatically adjust exposure based on image content')
-    parser.add_argument('--target_brightness', type=float, default=0.5,
-                        help='Target brightness for auto-exposure (0.3-0.7 recommended)')
-    parser.add_argument('--output_gamma', type=float, default=2.2,
-                        help='Output gamma correction (2.2 is standard for sRGB)')
-    parser.add_argument('--gamma', type=float, default=2.2,
-                        help='Gamma value for gamma tone mapping method')
-    parser.add_argument('--log_scale', type=float, default=1.0,
-                        help='Scale factor for log tone mapping')
-    parser.add_argument('--save_debug', action='store_true',
-                        help='Save debug comparison images with histograms')
-    parser.add_argument('--verify_summaries', action='store_true',
-                        help='Verify that optimized summary computation matches original')
+                        choices=['reinhard', 'gamma', 'log', 'simple', 'aces'])
+    parser.add_argument('--exposure', type=float, default=1.0)
+    parser.add_argument('--auto_exposure', action='store_true', default=True)
+    parser.add_argument('--target_brightness', type=float, default=0.5)
+    parser.add_argument('--output_gamma', type=float, default=2.2)
+    parser.add_argument('--gamma', type=float, default=2.2)
+    parser.add_argument('--log_scale', type=float, default=1.0)
+    parser.add_argument('--save_debug', action='store_true')
     args = parser.parse_args()
 
     test(args)
