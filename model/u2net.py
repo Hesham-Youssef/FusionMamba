@@ -158,7 +158,9 @@ class U2Net(nn.Module):
             nn.LeakyReLU()
         )
  
-        self.output_scale = nn.Parameter(torch.ones(1, img2_dim, 4, 4) * 0.1)
+        self.output_scale = nn.Parameter(
+            torch.ones(1, img2_dim, 1, 1) * 0.1
+        )
         
         skip_in_channels = img1_dim + img2_dim
         skip_mid = max(1, dim // 2)
@@ -198,7 +200,7 @@ class U2Net(nn.Module):
         # keep a small init for output_scale in __init__ like: self.output_scale = nn.Parameter(torch.ones(1,img2_dim,1,1)*0.1)
         # safe_scale = torch.clamp(self.output_scale, max=10.0)  # avoid runaway amplification
         
-        # linear = F.softplus(output) * self.output_scale.expand_as(output) + 1e-6       # (B, C, H, W), > 0
+        linear = F.softplus(output) * self.output_scale + 1e-6       # (B, C, H, W), > 0
 
         # spectral attention: average and clamp so it doesn't amplify >1
         img1_spe_attn = self.img1_spe_attn(org_img1)
