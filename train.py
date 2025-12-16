@@ -120,141 +120,89 @@ def prepare_training_data(args):
     print(f"  Smart sampler: {args.use_smart_sampler}")
     print(f"{'='*80}\n")
 
-    # If user provided a split CSV, use it
-    if args.split_csv:
-        if not args.data_dir:
-            # fallback to train_data_path if provided
-            if args.train_data_path:
-                data_dir = args.train_data_path
-            elif args.val_data_path:
-                data_dir = args.val_data_path
-            else:
-                raise ValueError("When using --split_csv you must provide --data_dir or --train_data_path/--val_data_path")
+    if not args.data_dir:
+        # fallback to train_data_path if provided
+        if args.train_data_path:
+            data_dir = args.train_data_path
+        elif args.val_data_path:
+            data_dir = args.val_data_path
         else:
-            data_dir = args.data_dir
-
-        print(f"Reading split CSV: {args.split_csv}")
-        splits = read_split_csv(args.split_csv)
-        train_scenes = splits.get('train', set())
-        val_scenes = splits.get('val', set())
-
-        available = set(p.name for p in Path(data_dir).iterdir() if p.is_dir())
-        missing_train = train_scenes - available
-        missing_val = val_scenes - available
-        if missing_train:
-            print(f"Warning: {len(missing_train)} train scenes from CSV not found in {data_dir}. They will be ignored.")
-        if missing_val:
-            print(f"Warning: {len(missing_val)} val scenes from CSV not found in {data_dir}. They will be ignored.")
-
-        train_scenes = sorted(list(train_scenes & available))
-        val_scenes = sorted(list(val_scenes & available))
-
-        print(f"Using {len(train_scenes)} scenes for training, {len(val_scenes)} for validation (from CSV).")
-
-        train_set = HDRDatasetMaxPerf(
-            data_dir=data_dir,
-            tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w,
-            split='train',
-            split_scenes=train_scenes,
-            max_cached_pairs=args.max_cached_pairs,
-            use_half=args.use_half,
-            num_load_threads=args.num_load_threads,
-            use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
-            summary_only=args.summary_only,
-            disk_max_size_bytes=args.disk_max_size_bytes
-        )
-
-        validate_set = HDRDatasetMaxPerf(
-            data_dir=data_dir,
-            tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w,
-            split='val',
-            split_scenes=val_scenes,
-            max_cached_pairs=args.max_cached_pairs,
-            use_half=args.use_half,
-            num_load_threads=args.num_load_threads,
-            use_disk_cache=False
-        )
-
+            raise ValueError("When using --split_csv you must provide --data_dir or --train_data_path/--val_data_path")
     else:
-        # Classic mode (backward compatible)
-        if not args.train_data_path or not args.val_data_path:
-            raise ValueError("train_data_path and val_data_path must be provided when not using --split_csv")
-        
-        train_set = HDRDatasetMaxPerf(
-            data_dir=args.train_data_path,
-            tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w,
-            max_cached_pairs=args.max_cached_pairs,
-            use_half=args.use_half,
-            num_load_threads=args.num_load_threads,
-            use_disk_cache=args.use_disk_cache,
-            disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
-            summary_only=args.summary_only,
-            disk_max_size_bytes=args.disk_max_size_bytes
-        )
+        data_dir = args.data_dir
 
-        validate_set = HDRDatasetMaxPerf(
-            data_dir=args.val_data_path,
-            tile_h=tile_h, tile_w=tile_w,
-            stride_h=stride_h, stride_w=stride_w,
-            max_cached_pairs=args.max_cached_pairs,
-            use_half=args.use_half,
-            num_load_threads=args.num_load_threads,
-            use_disk_cache=False
-        )
+    print(f"Reading split CSV: {args.split_csv}")
+    splits = read_split_csv(args.split_csv)
+    train_scenes = splits.get('train', set())
+    val_scenes = splits.get('val', set())
+
+    available = set(p.name for p in Path(data_dir).iterdir() if p.is_dir())
+    missing_train = train_scenes - available
+    missing_val = val_scenes - available
+    if missing_train:
+        print(f"Warning: {len(missing_train)} train scenes from CSV not found in {data_dir}. They will be ignored.")
+    if missing_val:
+        print(f"Warning: {len(missing_val)} val scenes from CSV not found in {data_dir}. They will be ignored.")
+
+    train_scenes = sorted(list(train_scenes & available))
+    val_scenes = sorted(list(val_scenes & available))
+
+    print(f"Using {len(train_scenes)} scenes for training, {len(val_scenes)} for validation (from CSV).")
+
+    train_set = HDRDatasetMaxPerf(
+        data_dir=data_dir,
+        tile_h=tile_h, tile_w=tile_w,
+        stride_h=stride_h, stride_w=stride_w,
+        split='train',
+        split_scenes=train_scenes,
+        max_cached_pairs=args.max_cached_pairs,
+        # use_half=args.use_half,
+        num_load_threads=args.num_load_threads,
+        use_disk_cache=args.use_disk_cache,
+        disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
+        summary_only=args.summary_only,
+        disk_max_size_bytes=args.disk_max_size_bytes,
+        use_log=True
+    )
+
+    validate_set = HDRDatasetMaxPerf(
+        data_dir=data_dir,
+        tile_h=tile_h, tile_w=tile_w,
+        stride_h=stride_h, stride_w=stride_w,
+        split='val',
+        split_scenes=val_scenes,
+        max_cached_pairs=args.max_cached_pairs,
+        # use_half=args.use_half,
+        num_load_threads=args.num_load_threads,
+        use_disk_cache=False,
+        use_log=True
+    )
+
 
     print(f"Training tiles: {len(train_set)}")
     print(f"Validation tiles: {len(validate_set)}")
 
-    # Create data loaders with optional smart sampler
-    if args.use_smart_sampler:
-        print("Using smart sampler for better cache locality")
-        train_sampler = train_set.get_smart_sampler(args.batch_size, shuffle=True)
-        training_data_loader = DataLoader(
-            dataset=train_set,
-            batch_sampler=train_sampler,
-            num_workers=args.num_workers,
-            pin_memory=False,
-            persistent_workers=False if args.num_workers > 0 else False,
-            prefetch_factor=1 if args.num_workers > 0 else None
-        )
-        
-        # Validation typically doesn't need smart sampler but we can use it
-        val_sampler = validate_set.get_smart_sampler(args.batch_size, shuffle=False)
-        validate_data_loader = DataLoader(
-            dataset=validate_set,
-            batch_sampler=val_sampler,
-            num_workers=args.num_workers,
-            pin_memory=False,
-            persistent_workers=False if args.num_workers > 0 else False,
-            prefetch_factor=1 if args.num_workers > 0 else None
-        )
-    else:
-        # Standard DataLoader
-        training_data_loader = DataLoader(
-            dataset=train_set,
-            num_workers=args.num_workers,
-            batch_size=args.batch_size,
-            shuffle=True,
-            pin_memory=False,
-            drop_last=True,
-            persistent_workers=False if args.num_workers > 0 else False,
-            prefetch_factor=1 if args.num_workers > 0 else None
-        )
-
-        validate_data_loader = DataLoader(
-            dataset=validate_set,
-            num_workers=args.num_workers,
-            batch_size=args.batch_size,
-            shuffle=False,
-            pin_memory=False,
-            drop_last=False,
-            persistent_workers=False if args.num_workers > 0 else False,
-            prefetch_factor=1 if args.num_workers > 0 else None
-        )
+    print("Using smart sampler for better cache locality")
+    train_sampler = train_set.get_smart_sampler(args.batch_size, shuffle=True)
+    training_data_loader = DataLoader(
+        dataset=train_set,
+        batch_sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=False if args.num_workers > 0 else False,
+        prefetch_factor=1 if args.num_workers > 0 else None
+    )
+    
+    # Validation typically doesn't need smart sampler but we can use it
+    val_sampler = validate_set.get_smart_sampler(args.batch_size, shuffle=False)
+    validate_data_loader = DataLoader(
+        dataset=validate_set,
+        batch_sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=False if args.num_workers > 0 else False,
+        prefetch_factor=1 if args.num_workers > 0 else None
+    )
 
     return training_data_loader, validate_data_loader, train_set, validate_set
 
@@ -491,8 +439,8 @@ if __name__ == "__main__":
                         help='Number of data loader workers')
 
     # DataLoader optimization features
-    parser.add_argument('--use_half', action='store_true',
-                        help='Use fp16 storage for 50%% memory reduction')
+    # parser.add_argument('--use_half', action='store_true',
+    #                     help='Use fp16 storage for 50%% memory reduction')
     parser.add_argument('--summary_only', type=bool, default=True)
     parser.add_argument('--disk_max_size_bytes', type=int, default=5 * (1024 ** 3))
     parser.add_argument('--num_load_threads', type=int, default=4,
