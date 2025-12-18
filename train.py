@@ -194,11 +194,11 @@ def train(args, training_data_loader, train_set):
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
-
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
     # Print model summary
     print("\nModel Architecture:")
     summary(
-        model,
+        raw_model,
         input_size=[
             (args.batch_size, 3, args.H, args.W),  # ldr1
             (args.batch_size, 3, args.H, args.W),  # ldr2
@@ -210,7 +210,11 @@ def train(args, training_data_loader, train_set):
     
     # Optimizer and LR scheduler
     optimizer = torch.optim.AdamW([
-        {"params": [p for n,p in model.named_parameters() if "scale_net" not in n], "lr": args.lr},
+        {
+        "params": [p for n, p in raw_model.named_parameters()
+                   if "scale_net" not in n and "skip_scale_net" not in n],
+        "lr": args.lr
+        },
         {"params": model.scale_net.parameters(), "lr": args.lr * 0.1},
         {"params": model.skip_scale_net.parameters(), "lr": args.lr * 0.1},
     ])
@@ -286,7 +290,7 @@ def train(args, training_data_loader, train_set):
             print(f'{"="*80}\n')
             t_start = time.time()
 
-            save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
+            save_checkpoint(args, raw_model, optimizer, lr_scheduler, epoch)
 
         # Final checkpoint
         # save_checkpoint(args, model, optimizer, lr_scheduler, args.epoch)
@@ -396,4 +400,5 @@ if __name__ == "__main__":
     print("="*80)
 
     training_data_loader, train_set = prepare_training_data(args)
+
     train(args, training_data_loader, train_set)
