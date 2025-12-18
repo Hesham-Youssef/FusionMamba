@@ -7,7 +7,6 @@ import math
 import csv
 import pickle
 from pathlib import Path
-from functools import lru_cache
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -18,6 +17,7 @@ import cv2
 import torch
 import torch.nn.functional as F
 import torch.utils.data as data
+from utils.tools import compute_summary_fast, extract_tiles_optimized, load_image_fast, prepare_tensors_for_training, compute_tile_params
 
 import imageio.v2 as imageio
 
@@ -32,77 +32,6 @@ class Config:
     USE_DISK_CACHE = False  # Cache preprocessed tiles to disk
     DISK_CACHE_DIR = None
 
-
-# -----------------------------
-# Utils
-# -----------------------------
-
-def _to_tensor_fast(image_np, is_hdr=False, use_half=False):
-    """Optimized tensor conversion with safer HDR/LDR handling."""
-    # ensure numpy array
-    img = image_np
-
-    # If image is integer type, convert to float32 first
-    if img.dtype == np.uint8:
-        img = img.astype(np.float32)
-        # interpret uint8 as 0..255 LDR
-        if not is_hdr:
-            img = img * (1.0 / 255.0)
-    elif img.dtype == np.uint16:
-        # uint16 often means 0..65535 (tiff) — try to preserve radiance if HDR flagged
-        img = img.astype(np.float32)
-        if not is_hdr:
-            img = img * (1.0 / 65535.0)
-        # if is_hdr, we *preserve* raw float values (user should confirm)
-    elif img.dtype != np.float32:
-        img = img.astype(np.float32)
-
-    # If it's marked as HDR but values look tiny (<=1), warn (helps debug)
-    if is_hdr:
-        mx = float(img.max()) if hasattr(img, "max") else None
-        if mx is not None and mx <= 1.5:
-            # this is suspicious for HDR radiance — leave it but warn
-            print(f"WARNING: loaded HDR image has max {mx:.4f} (<=1.5). Are files normalized?")
-
-    if img.ndim == 2:
-        img = img[:, :, None]
-
-    tensor = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
-    if use_half:
-        return tensor.half()
-    return tensor.float()
-
-@lru_cache(maxsize=64)
-def make_hann_window(h, w, device_str='cpu', use_half=False):
-    """Cached Hann window with fp16 support."""
-    device = torch.device(device_str)
-    dtype = torch.float16 if use_half else torch.float32
-    
-    wh = torch.hann_window(h, periodic=False, dtype=dtype, device=device) if h > 1 else torch.ones(1, dtype=dtype, device=device)
-    ww = torch.hann_window(w, periodic=False, dtype=dtype, device=device) if w > 1 else torch.ones(1, dtype=dtype, device=device)
-    return wh.unsqueeze(1) @ ww.unsqueeze(0)
-
-
-def load_image_fast(path):
-    """Fast image loading with correct HDR handling."""
-    ext = os.path.splitext(path)[1].lower()
-
-    if ext == ".hdr":
-        # imageio preserves Radiance HDR radiance correctly
-        img = imageio.imread(path).astype(np.float32)
-
-        # imageio returns RGB already
-        return img
-
-    # LDR path (OpenCV is fine here)
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise RuntimeError(f"Failed to read {path}")
-
-    if img.ndim == 3 and img.shape[2] == 3:
-        return img[:, :, ::-1].copy()  # BGR → RGB
-
-    return img
 
 # -----------------------------
 # Parallel Image Loader
@@ -144,12 +73,11 @@ class DiskCacheManager:
     INDEX_NAME = "cache_index.json"
 
     def __init__(self, cache_dir, max_size_bytes=None,
-                 summary_only=False, downsample_factor=8, use_half=False):
+                 summary_only=False, downsample_factor=8):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.max_size_bytes = int(max_size_bytes) if max_size_bytes is not None else None
         self.summary_only = bool(summary_only)
         self.downsample_factor = max(1, int(downsample_factor))
-        self.use_half = bool(use_half)
 
         self._lock = threading.Lock()         # in-process lock for index ops
         self._index = {}
@@ -284,16 +212,12 @@ class DiskCacheManager:
                 if 'sum1' in data:
                     try:
                         a = data['sum1'].cpu().numpy()
-                        if self.use_half:
-                            a = a.astype(np.float16)
                         to_save['sum1'] = a
                     except Exception:
                         pass
                 if 'sum2' in data:
                     try:
                         a = data['sum2'].cpu().numpy()
-                        if self.use_half:
-                            a = a.astype(np.float16)
                         to_save['sum2'] = a
                     except Exception:
                         pass
@@ -309,8 +233,6 @@ class DiskCacheManager:
                                  max(1, tiles_g0.shape[-1] // self.downsample_factor))
                             )
                             arr = preview.numpy()
-                            if self.use_half:
-                                arr = arr.astype(np.float16)
                             to_save['preview'] = arr
                     except Exception:
                         pass
@@ -322,8 +244,6 @@ class DiskCacheManager:
                             a = v.cpu().numpy()
                         else:
                             a = np.asarray(v)
-                        if self.use_half and a.dtype == np.float32:
-                            a = a.astype(np.float16)
                         to_save[k] = a
                     except Exception:
                         continue
@@ -444,93 +364,6 @@ class DiskCacheManager:
             except Exception:
                 pass
 
-
-# -----------------------------
-# Optimized Tiling
-# -----------------------------
-
-def compute_tile_params(H, W, tile_h, tile_w, stride_h, stride_w):
-    """Compute tiling parameters."""
-    if H <= tile_h:
-        pad_top, pad_bottom = 0, tile_h - H
-        n_steps_h = 1
-    else:
-        n_steps_h = (H - tile_h + stride_h - 1) // stride_h + 1
-        full_covered_h = (n_steps_h - 1) * stride_h + tile_h
-        pad_top, pad_bottom = 0, max(0, full_covered_h - H)
-
-    if W <= tile_w:
-        pad_left, pad_right = 0, tile_w - W
-        n_steps_w = 1
-    else:
-        n_steps_w = (W - tile_w + stride_w - 1) // stride_w + 1
-        full_covered_w = (n_steps_w - 1) * stride_w + tile_w
-        pad_left, pad_right = 0, max(0, full_covered_w - W)
-
-    return (pad_top, pad_bottom, pad_left, pad_right), n_steps_h, n_steps_w
-
-
-def extract_tiles_optimized(img, tile_h, tile_w, stride_h, stride_w, pad_mode='reflect'):
-    """Ultra-optimized tile extraction using unfold."""
-    C, H, W = img.shape
-    
-    pad_info, n_h, n_w = compute_tile_params(H, W, tile_h, tile_w, stride_h, stride_w)
-    pad_top, pad_bottom, pad_left, pad_right = pad_info
-    
-    # Minimize padding operations
-    needs_pad = any(x > 0 for x in pad_info)
-    if needs_pad:
-        img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
-    
-    # Single unfold operation for all tiles
-    tiles = img.unfold(1, tile_h, stride_h).unfold(2, tile_w, stride_w)
-    tiles = tiles.permute(1, 2, 0, 3, 4).reshape(-1, C, tile_h, tile_w)
-    
-    # Vectorized coordinate generation
-    ys = torch.arange(n_h) * stride_h - pad_top
-    xs = torch.arange(n_w) * stride_w - pad_left
-    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-    
-    coords = []
-    for i in range(n_h * n_w):
-        y, x = yy.flatten()[i].item(), xx.flatten()[i].item()
-        y0, x0 = max(0, y), max(0, x)
-        y1, x1 = min(H, y + tile_h), min(W, x + tile_w)
-        coords.append((y0, y1, x0, x1))
-    
-    return tiles, coords, (H, W)
-
-
-def compute_summary_fast(ldr, tiles, coords, orig_shape, tile_h, tile_w, use_half=False):
-    """Optimized summary with minimal allocations (fixed)."""
-    # orig_shape is (H, W)
-    H, W = orig_shape
-    C = int(ldr.shape[0])
-    device = ldr.device
-    dtype = ldr.dtype
-
-    # Reuse buffers
-    merged = torch.zeros((C, H, W), dtype=dtype, device=device)
-    weights = torch.zeros((1, H, W), dtype=dtype, device=device)
-
-    # Ensure make_hann_window gets stable args (device as string)
-    window = make_hann_window(tile_h, tile_w, device_str=str(device), use_half=use_half)
-
-    # Batch process tiles when possible
-    for idx, (y0, y1, x0, x1) in enumerate(coords):
-        vh, vw = y1 - y0, x1 - x0
-        w = window[:vh, :vw].unsqueeze(0)   # (1, vh, vw)
-        # In-place operations: tiles[idx] has shape (C, tile_h, tile_w)
-        patch = tiles[idx, :, :vh, :vw]
-        merged[:, y0:y1, x0:x1].add_(patch.mul(w))
-        weights[:, y0:y1, x0:x1].add_(w)
-
-    # normalize (avoid division by zero)
-    merged.div_(weights.clamp(min=1e-8))
-
-    # Fast downsampling -> return same shape as tile (C, tile_h, tile_w)
-    return F.adaptive_avg_pool2d(merged.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
-
 # -----------------------------
 # Smart Sampler - groups tiles from same pair
 # -----------------------------
@@ -570,7 +403,6 @@ class SmartBatchSampler(data.Sampler):
     def __len__(self):
         return (len(self.tile_index) + self.batch_size - 1) // self.batch_size
 
-
 # -----------------------------
 # Maximum Performance Dataset
 # -----------------------------
@@ -580,12 +412,11 @@ class HDRDatasetMaxPerf(data.Dataset):
     def __init__(self, data_dir, transform=None,
                  tile_h=256, tile_w=256, stride_h=None, stride_w=None,
                  split=None, split_scenes=None,
-                 max_cached_pairs=16, use_half=False, 
+                 max_cached_pairs=16,
                  num_load_threads=4, use_disk_cache=False, disk_cache_dir=None,
                  disk_max_size_bytes=(5 * 1024 ** 3), summary_only=True):
         """
         Args:
-            use_half: Store tiles in fp16 (50% memory reduction)
             num_load_threads: Parallel image loading threads
             use_disk_cache: Cache preprocessed tiles to disk
             disk_cache_dir: Directory for disk cache
@@ -596,7 +427,6 @@ class HDRDatasetMaxPerf(data.Dataset):
         self.tile_w = tile_w
         self.stride_h = stride_h or tile_h
         self.stride_w = stride_w or tile_w
-        self.use_half = use_half
         self.max_cached_pairs = max_cached_pairs
         
         worker_info = torch.utils.data.get_worker_info()
@@ -618,8 +448,7 @@ class HDRDatasetMaxPerf(data.Dataset):
             disk_cache_dir if use_disk_cache else None,
             max_size_bytes=disk_max_size_bytes,   # set default to 5 GB, or pass via args
             summary_only=summary_only,                # -> very small cache (only sums + tiny tiles)
-            downsample_factor=4,
-            use_half=self.use_half
+            downsample_factor=4
         )
         
         # Build pairs
@@ -675,8 +504,6 @@ class HDRDatasetMaxPerf(data.Dataset):
                 self._tile_index.append((pair_idx, t))
         
         print(f"Index: {len(self._tile_index)} tiles, {len(self.pairs)} pairs")
-        if self.use_half:
-            print("Using fp16 storage (50% memory reduction)")
     
     def _load_pair_data(self, pair_idx):
         """Load with proper cache hierarchy."""
@@ -709,10 +536,7 @@ class HDRDatasetMaxPerf(data.Dataset):
             pair['ldr1'], pair['ldr2'], pair['hdr']
         )
         
-        # Convert and process
-        t1 = _to_tensor_fast(ldr1, False, self.use_half)
-        t2 = _to_tensor_fast(ldr2, False, self.use_half)
-        tg = _to_tensor_fast(hdr, True, self.use_half)
+        t1, t2, tg = prepare_tensors_for_training(ldr1, ldr2, hdr)
         
         if self.transform:
             tg, t1, t2 = self.transform(tg, t1, t2)
@@ -734,8 +558,8 @@ class HDRDatasetMaxPerf(data.Dataset):
             sum2 = cached['sum2']
         else:
             # Compute summaries from scratch
-            sum1 = compute_summary_fast(t1, tiles1, coords, shape, self.tile_h, self.tile_w, self.use_half)
-            sum2 = compute_summary_fast(t2, tiles2, coords, shape, self.tile_h, self.tile_w, self.use_half)
+            sum1 = compute_summary_fast(t1, tiles1, coords, shape, self.tile_h, self.tile_w)
+            sum2 = compute_summary_fast(t2, tiles2, coords, shape, self.tile_h, self.tile_w)
         
         data = {
             'tiles_g': tiles_g,
@@ -795,9 +619,6 @@ class HDRDatasetMaxPerf(data.Dataset):
             data['sum2']
         )
         
-        # Convert back to fp32 if needed
-        if self.use_half:
-            return tuple(t.float() if t.dtype == torch.float16 else t for t in tiles)
         return tiles
 
     
@@ -876,8 +697,6 @@ if __name__ == "__main__":
     parser.add_argument("--stride_h", type=int, default=192)
     parser.add_argument("--stride_w", type=int, default=192)
     parser.add_argument("--max_cached_pairs", type=int, default=16)
-    parser.add_argument("--use_half", action='store_true',
-                        help="Use fp16 storage (50% memory reduction)")
     parser.add_argument("--num_load_threads", type=int, default=4,
                         help="Parallel image loading threads")
     parser.add_argument("--use_disk_cache", action='store_true',
@@ -902,14 +721,13 @@ if __name__ == "__main__":
         split=args.split if args.split != 'all' else None,
         split_scenes=split_scenes,
         max_cached_pairs=args.max_cached_pairs,
-        use_half=args.use_half,
         num_load_threads=args.num_load_threads,
         use_disk_cache=args.use_disk_cache,
         disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None
     )
     
     print(f"Dataset: {len(ds)} tiles")
-    print(f"Features: half={args.use_half}, threads={args.num_load_threads}, "
+    print(f"Features: threads={args.num_load_threads}, "
           f"disk_cache={args.use_disk_cache}, smart_sampler={args.use_smart_sampler}")
     
     # Use smart sampler if requested

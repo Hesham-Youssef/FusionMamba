@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # tester_tiled_optimized_FIXED.py
 """
-FIXED version with correct HDR handling:
+FIXED version with correct HDR handling and optimized tiling:
 1. Use imageio for HDR loading (matches training)
 2. Remove premature clamping of model output
 3. Apply proper inverse transformation (expm1)
+4. Use optimized tiling functions from utils.tools
+5. CRITICAL: Use unified image_utils to ensure exact consistency with training
+   - Same tensor conversion (_to_tensor_fast)
+   - Same image loading (load_image_fast)
+   - Same preprocessing (prepare_tensors_for_inference)
 """
 
 import os
@@ -17,140 +22,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from contextlib import nullcontext
-import imageio.v2 as imageio  # FIXED: Use imageio for HDR
+import imageio.v2 as imageio
 
-# --- Utilities ---
-def _to_tensor_and_normalize(image_np, is_hdr=False):
-    img = image_np.astype(np.float32)
-    if not is_hdr:
-        if img.max() > 1.5:
-            img = img / 255.0
-    if img.ndim == 2:
-        img = img[:, :, None]
-    img_t = torch.from_numpy(img).permute(2, 0, 1).float()
-    return img_t
-
-def make_hann_window(h, w, device=None, dtype=torch.float32):
-    if h == 1:
-        wh = torch.tensor([1.0], dtype=dtype, device=device)
-    else:
-        wh = torch.hann_window(h, periodic=False, dtype=dtype, device=device)
-    if w == 1:
-        ww = torch.tensor([1.0], dtype=dtype, device=device)
-    else:
-        ww = torch.hann_window(w, periodic=False, dtype=dtype, device=device)
-    return wh.unsqueeze(1) @ ww.unsqueeze(0)
-
-class TileGenerator:
-    """Memory-efficient tile generator that yields tiles on-the-fly"""
-    def __init__(self, img, tile_h, tile_w, stride_h, stride_w, pad_mode='reflect'):
-        self.img = img
-        self.tile_h = tile_h
-        self.tile_w = tile_w
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_mode = pad_mode
-        
-        C, H, W = img.shape
-        self.orig_shape = (H, W)
-        
-        # Compute padding
-        if H <= tile_h:
-            pad_top, pad_bottom = 0, tile_h - H
-        else:
-            n_steps_h = math.ceil((H - tile_h) / float(stride_h)) + 1
-            full_covered_h = (n_steps_h - 1) * stride_h + tile_h
-            pad_top, pad_bottom = 0, max(0, full_covered_h - H)
-
-        if W <= tile_w:
-            pad_left, pad_right = 0, tile_w - W
-        else:
-            n_steps_w = math.ceil((W - tile_w) / float(stride_w)) + 1
-            full_covered_w = (n_steps_w - 1) * stride_w + tile_w
-            pad_left, pad_right = 0, max(0, full_covered_w - W)
-
-        self.pads = (pad_top, pad_bottom, pad_left, pad_right)
-        
-        if any(x > 0 for x in self.pads):
-            self.img_p = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=pad_mode)
-        else:
-            self.img_p = img
-            
-        _, self.Hp, self.Wp = self.img_p.shape
-        
-    def __iter__(self):
-        """Yields (tile, coord) tuples"""
-        H, W = self.orig_shape
-        pad_top, _, pad_left, _ = self.pads
-        
-        for y in range(0, self.Hp - self.tile_h + 1, self.stride_h):
-            for x in range(0, self.Wp - self.tile_w + 1, self.stride_w):
-                tile = self.img_p[:, y:y + self.tile_h, x:x + self.tile_w]
-                y0 = max(0, y - pad_top)
-                x0 = max(0, x - pad_left)
-                y1 = min(H, y - pad_top + self.tile_h)
-                x1 = min(W, x - pad_left + self.tile_w)
-                yield tile, (y0, y1, x0, x1)
-    
-    def get_all_coords(self):
-        """Get all coordinates without extracting tiles"""
-        H, W = self.orig_shape
-        pad_top, _, pad_left, _ = self.pads
-        coords = []
-        
-        for y in range(0, self.Hp - self.tile_h + 1, self.stride_h):
-            for x in range(0, self.Wp - self.tile_w + 1, self.stride_w):
-                y0 = max(0, y - pad_top)
-                x0 = max(0, x - pad_left)
-                y1 = min(H, y - pad_top + self.tile_h)
-                x1 = min(W, x - pad_left + self.tile_w)
-                coords.append((y0, y1, x0, x1))
-        return coords
-
-
-def compute_summary_efficient(ldr1, ldr2, tile_h, tile_w, stride_h, stride_w, device):
-    """Efficient summary computation using streaming approach"""
-    H, W = ldr1.shape[1], ldr1.shape[2]
-    
-    # Create generators
-    gen1 = TileGenerator(ldr1, tile_h, tile_w, stride_h, stride_w)
-    gen2 = TileGenerator(ldr2, tile_h, tile_w, stride_h, stride_w)
-    
-    # Merge with Hann weighting (streaming)
-    win = make_hann_window(tile_h, tile_w, device=device, dtype=ldr1.dtype)
-    
-    out1 = torch.zeros_like(ldr1)
-    out2 = torch.zeros_like(ldr2)
-    wgt = torch.zeros((1, H, W), dtype=ldr1.dtype, device=device)
-    
-    for (tile1, coord), (tile2, _) in zip(gen1, gen2):
-        y0, y1, x0, x1 = coord
-        vh, vw = y1 - y0, x1 - x0
-        ws = win[:vh, :vw].unsqueeze(0)
-        
-        out1[:, y0:y1, x0:x1] += tile1[:, :vh, :vw] * ws
-        out2[:, y0:y1, x0:x1] += tile2[:, :vh, :vw] * ws
-        wgt[:, y0:y1, x0:x1] += ws
-    
-    out1 = out1 / (wgt + 1e-8)
-    out2 = out2 / (wgt + 1e-8)
-    
-    # Downsample to summary size
-    sum1 = F.adaptive_avg_pool2d(out1.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
-    sum2 = F.adaptive_avg_pool2d(out2.unsqueeze(0), (tile_h, tile_w)).squeeze(0)
-    
-    return sum1, sum2
-
-
-def compute_metrics(sr, gt):
-    from pytorch_msssim import ssim
-    sr = sr.clamp(0, 1)
-    gt = gt.clamp(0, 1)
-    ssim_val = ssim(sr, gt, data_range=1.0, size_average=True).item()
-    mse = ((sr - gt) ** 2).mean()
-    psnr_val = 10 * torch.log10(1.0 / (mse + 1e-12)).item()
-    return ssim_val, psnr_val
-
+# Import optimized tiling functions
+from utils.tools import compute_summary_fast, extract_tiles_optimized, make_hann_window, load_image_fast, prepare_tensors_for_inference
 
 def test(args):
     # Model load
@@ -160,27 +35,24 @@ def test(args):
         args.spa_channels,
         args.spe_channels,
         args.cut_size + 2 * args.pad,
-        args.cut_size + 2 * args.pad,
-        args.ratio
+        args.cut_size + 2 * args.pad
     ).to(args.device)
 
-    state_dict = torch.load(args.weight, map_location=args.device)
+    state_dict = torch.load(args.weight, map_location=args.device)    
     if isinstance(state_dict, dict):
         if 'model_state' in state_dict:
             state_dict = state_dict['model_state']
         elif 'state_dict' in state_dict:
             state_dict = state_dict['state_dict']
 
-    new_state = {}
-    for k, v in state_dict.items():
-        new_state[k.replace('module.', '')] = v
-    model.load_state_dict(new_state)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     
     # Enable mixed precision if requested
     use_amp = args.use_amp and args.device == 'cuda'
     if use_amp:
-        print("Using automatic mixed precision (AMP)")
+        print("Using automatic mixed precision (AMP) for model inference")
+        print("Note: Summaries always computed in float32 for consistency with training")
     
     if args.batch_size > 1:
         print(f"Using batch processing with batch_size={args.batch_size}")
@@ -194,311 +66,278 @@ def test(args):
         if os.path.isdir(os.path.join(args.test_data_path, d))
     )
 
+    import glob
     for idx, scene in enumerate(scenes):
         scene_path = os.path.join(args.test_data_path, scene)
 
         ldr_files = sorted(
-            f for f in os.listdir(scene_path)
-            if f.startswith("input_") and f.endswith("_aligned.tif")
+            f for f in glob.glob(os.path.join(scene_path, "input_*.tif"))
+            if "_aligned" not in os.path.basename(f)
         )
-        hdr_files = sorted(
-            f for f in os.listdir(scene_path)
-            if f.startswith("ref_hdr") and f.endswith("_aligned.hdr")
-        )
-        if len(ldr_files) < 2 or len(hdr_files) == 0:
+        hdr_files = glob.glob(os.path.join(scene_path, "ref_hdr.hdr"))
+        if len(ldr_files) < 3 or len(hdr_files) == 0:
+            print(f"Skipping scene {scene}: insufficient files")
             continue
 
-        # Read LDR images with OpenCV (fine for LDR)
-        ldr_long = cv2.imread(os.path.join(scene_path, ldr_files[0]), -1).astype(np.float32) / 255.0
-        ldr_short = cv2.imread(os.path.join(scene_path, ldr_files[1]), -1).astype(np.float32) / 255.0
+        print(f"\n{'='*80}")
+        print(f"Processing Scene {idx+1}: {scene}")
+        print(f"{'='*80}")
+
+        # Read all 3 LDR images and ground truth
+        img0 = load_image_fast(ldr_files[0])  # Darkest exposure
+        img1 = load_image_fast(ldr_files[1])  # Middle exposure
+        img2 = load_image_fast(ldr_files[2])  # Brightest exposure
+        gt_hdr = load_image_fast(hdr_files[0])  # Ground truth HDR
+
+        # Process both pairs
+        pairs = [
+            ("pair_1-0", img1, img0, "middle+dark"),
+            ("pair_1-2", img1, img2, "middle+bright")
+        ]
         
-        # FIXED: Use imageio for HDR (matches training loader)
-        gt_hdr = imageio.imread(os.path.join(scene_path, hdr_files[0])).astype(np.float32)
-
-        if ldr_long.ndim == 3:
-            ldr_long = cv2.cvtColor(ldr_long, cv2.COLOR_BGR2RGB)
-            ldr_short = cv2.cvtColor(ldr_short, cv2.COLOR_BGR2RGB)
-        # gt_hdr already in RGB from imageio
-
-        # To tensors
-        t1 = _to_tensor_and_normalize(ldr_long).to(args.device)
-        t2 = _to_tensor_and_normalize(ldr_short).to(args.device)
-
-        H, W = t1.shape[1], t1.shape[2]
-
-        # Compute summaries
-        cut = args.cut_size
-        stride = cut // 2
-
-        sum1, sum2 = compute_summary_efficient(
-            t1, t2, cut, cut, stride, stride, args.device
-        )
+        hdr_results = {}
         
-        # Prepare for tiled inference
-        pad = args.pad
-        ratio = args.ratio
-        ms_size = cut // ratio
-
-        ldr_long_t = torch.from_numpy(ldr_long).permute(2, 0, 1).unsqueeze(0).to(args.device)
-        ldr_short_t = torch.from_numpy(ldr_short).permute(2, 0, 1).unsqueeze(0).to(args.device)
-
-        ldr_long_pad = F.pad(ldr_long_t, (pad, pad, pad, pad), 'reflect')
-        ldr_short_pad = F.pad(
-            ldr_short_t,
-            (pad // ratio, pad // ratio, pad // ratio, pad // ratio),
-            'reflect'
-        )
-
-        edge_H = (cut - (H % cut)) % cut
-        edge_W = (cut - (W % cut)) % cut
-
-        ldr_long_pad = F.pad(ldr_long_pad, (0, edge_W, 0, edge_H), 'reflect')
-        ldr_short_pad = F.pad(
-            ldr_short_pad,
-            (0, edge_W // ratio, 0, edge_H // ratio),
-            'reflect'
-        )
-
-        H_pad, W_pad = ldr_long_pad.shape[2:]
-        C = ldr_long_pad.shape[1]
-
-        # Accumulators
-        out_acc = torch.zeros((1, C, H_pad, W_pad), device=args.device)
-        w_acc = torch.zeros((1, 1, H_pad, W_pad), device=args.device)
-
-        win = make_hann_window(cut, cut, device=args.device).unsqueeze(0)
-
-        sum1_b = sum1.unsqueeze(0)
-        sum2_b = sum2.unsqueeze(0)
-
-        # Collect tile positions
-        tile_positions = []
-        for y in range(0, H_pad - cut + 1, stride):
-            for x in range(0, W_pad - cut + 1, stride):
-                tile_positions.append((y, x))
-
-        # Batch processing
-        batch_size = args.batch_size
-        
-        # Track raw model outputs
-        if args.save_debug:
-            raw_outputs_sample = []
-        
-        with torch.no_grad():
-            autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
+        for pair_name, img_a, img_b, pair_desc in pairs:
+            print(f"\n--- Processing {pair_desc} ({pair_name}) ---")
             
-            for batch_start in range(0, len(tile_positions), batch_size):
-                batch_end = min(batch_start + batch_size, len(tile_positions))
-                batch_tiles = tile_positions[batch_start:batch_end]
+            # Convert to tensors
+            t_a, t_b = prepare_tensors_for_inference(img_a, img_b, device=args.device)
+            
+            H, W = t_a.shape[1], t_a.shape[2]
+
+            # Compute summaries
+            cut = args.cut_size
+            stride = cut // 2
+
+            tiles_a, coords_a, orig_shape_a = extract_tiles_optimized(
+                t_a, cut, cut, stride, stride, pad_mode='reflect'
+            )
+            tiles_b, coords_b, orig_shape_b = extract_tiles_optimized(
+                t_b, cut, cut, stride, stride, pad_mode='reflect'
+            )
+
+            sum_a = compute_summary_fast(t_a, tiles_a, coords_a, orig_shape_a, cut, cut)
+            sum_b = compute_summary_fast(t_b, tiles_b, coords_b, orig_shape_b, cut, cut)
+            
+            if args.save_debug:
+                print(f'  sum_a: min={sum_a.min():.4f}, max={sum_a.max():.4f}, mean={sum_a.mean():.4f}')
+                print(f'  sum_b: min={sum_b.min():.4f}, max={sum_b.max():.4f}, mean={sum_b.mean():.4f}')
+            
+            # Prepare for tiled inference
+            pad = args.pad
+            ratio = args.ratio
+            ms_size = cut // ratio
+            
+            img_a_t = t_a.unsqueeze(0)
+            img_b_t = t_b.unsqueeze(0)
+
+            img_a_pad = F.pad(img_a_t, (pad, pad, pad, pad), 'reflect')
+            img_b_pad = F.pad(
+                img_b_t,
+                (pad // ratio, pad // ratio, pad // ratio, pad // ratio),
+                'reflect'
+            )
+
+            edge_H = (cut - (H % cut)) % cut
+            edge_W = (cut - (W % cut)) % cut
+
+            img_a_pad = F.pad(img_a_pad, (0, edge_W, 0, edge_H), 'reflect')
+            img_b_pad = F.pad(
+                img_b_pad,
+                (0, edge_W // ratio, 0, edge_H // ratio),
+                'reflect'
+            )
+
+            H_pad, W_pad = img_a_pad.shape[2:]
+            C = img_a_pad.shape[1]
+
+            # Accumulators
+            out_acc = torch.zeros((1, C, H_pad, W_pad), device=args.device)
+            w_acc = torch.zeros((1, 1, H_pad, W_pad), device=args.device)
+
+            win = make_hann_window(cut, cut, device_str=str(args.device)).unsqueeze(0)
+
+            sum_a_b = sum_a.unsqueeze(0)
+            sum_b_b = sum_b.unsqueeze(0)
+
+            # Collect tile positions
+            tile_positions = []
+            for y in range(0, H_pad - cut + 1, stride):
+                for x in range(0, W_pad - cut + 1, stride):
+                    tile_positions.append((y, x))
+
+            batch_size = args.batch_size
+
+            with torch.no_grad():
+                autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
                 
-                # Prepare batch
-                MS_batch = []
-                PAN_batch = []
-                
-                for y, x in batch_tiles:
-                    MS_patch = ldr_short_pad[
-                        :, :,
-                        y // ratio : y // ratio + ms_size + pad // 2,
-                        x // ratio : x // ratio + ms_size + pad // 2
-                    ]
-                    PAN_patch = ldr_long_pad[
-                        :, :,
-                        y : y + cut + 2 * pad,
-                        x : x + cut + 2 * pad
-                    ]
-                    MS_batch.append(MS_patch)
-                    PAN_batch.append(PAN_patch)
-                
-                MS_batch = torch.cat(MS_batch, dim=0)
-                PAN_batch = torch.cat(PAN_batch, dim=0)
-                
-                # Replicate summaries for batch
-                sum1_batch = sum1_b.expand(len(batch_tiles), -1, -1, -1)
-                sum2_batch = sum2_b.expand(len(batch_tiles), -1, -1, -1)
-                
-                # Inference with mixed precision
-                with autocast_context:
-                    sr_batch = model(MS_batch, PAN_batch, sum1_batch, sum2_batch)
-                
-                # CRITICAL: Save raw model output BEFORE any transformation
-                if args.save_debug and batch_start == 0:
-                    raw_outputs_sample.append(sr_batch[0].detach().clone())
-                
-                # FIXED: Convert to float32 and apply inverse transformation
-                sr_batch = sr_batch.float()
-                
-                # FIXED: Apply inverse log transformation (expm1 = exp(x) - 1)
-                # This converts from log space back to linear HDR space
-                sr_batch = torch.expm1(sr_batch)
-                
-                # FIXED: Only clip negative values (allow large HDR values)
-                # sr_batch = sr_batch.clamp(min=0)
-                
-                # Accumulate results
-                for i, (y, x) in enumerate(batch_tiles):
-                    sr_center = sr_batch[i:i+1, :, pad:pad + cut, pad:pad + cut]
-                    out_acc[:, :, y:y + cut, x:x + cut] += sr_center * win
-                    w_acc[:, :, y:y + cut, x:x + cut] += win
-                
-                # Clear batch from GPU memory
-                del MS_batch, PAN_batch, sum1_batch, sum2_batch, sr_batch
-                if args.device == 'cuda':
-                    torch.cuda.empty_cache()
+                for batch_start in range(0, len(tile_positions), batch_size):
+                    batch_end = min(batch_start + batch_size, len(tile_positions))
+                    batch_tiles = tile_positions[batch_start:batch_end]
+                    
+                    img_a_batch = []
+                    img_b_batch = []
+                    
+                    for y, x in batch_tiles:
+                        img_b_patch = img_b_pad[
+                            :, :,
+                            y // ratio : y // ratio + ms_size + pad // 2,
+                            x // ratio : x // ratio + ms_size + pad // 2
+                        ]
+                        img_a_patch = img_a_pad[
+                            :, :,
+                            y : y + cut + 2 * pad,
+                            x : x + cut + 2 * pad
+                        ]
+                        img_a_batch.append(img_a_patch)
+                        img_b_batch.append(img_b_patch)
+                    
+                    img_a_batch = torch.cat(img_a_batch, dim=0)
+                    img_b_batch = torch.cat(img_b_batch, dim=0)
+                    
+                    sum_a_batch = sum_a_b.expand(len(batch_tiles), -1, -1, -1)
+                    sum_b_batch = sum_b_b.expand(len(batch_tiles), -1, -1, -1)
+                    
+                    with autocast_context:
+                        sr_batch, _, _, _ = model(img_a_batch, img_b_batch, sum_a_batch, sum_b_batch)
+                    
+                    sr_batch = sr_batch.float()
+                    sr_batch = torch.expm1(sr_batch)
+                    
+                    for i, (y, x) in enumerate(batch_tiles):
+                        sr_center = sr_batch[i:i+1, :, pad:pad + cut, pad:pad + cut]
+                        out_acc[:, :, y:y + cut, x:x + cut] += sr_center * win
+                        w_acc[:, :, y:y + cut, x:x + cut] += win
+                    
+                    del img_a_batch, img_b_batch, sum_a_batch, sum_b_batch, sr_batch
+                    if args.device == 'cuda':
+                        torch.cuda.empty_cache()
 
-        out_final = out_acc / (w_acc + 1e-8)
-        out_final = out_final[:, :, :H, :W]
+            out_final = out_acc / (w_acc + 1e-8)
+            out_final = out_final[:, :, :H, :W]
+            
+            # Store result
+            hdr_results[pair_name] = out_final.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            
+            print(f"  {pair_name} HDR range: [{hdr_results[pair_name].min():.4f}, {hdr_results[pair_name].max():.4f}]")
+            print(f"  {pair_name} HDR mean: {hdr_results[pair_name].mean():.4f}")
 
-        # Save outputs
-        output_np = out_final.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        # Save individual results
+        print(f"\nSaving outputs for scene {scene}...")
         
-        # ============================================================
-        # DIAGNOSTIC: Analyze processing pipeline
-        # ============================================================
-        if args.save_debug:
-            print(f'\n  [DIAGNOSTIC] Processing Analysis for Sample {idx+1}:')
-            print(f'  {"="*60}')
+        for pair_name, hdr_output in hdr_results.items():
+            output_path = os.path.join(args.save_dir, f"{scene}_{pair_name}.hdr")
+            cv2.imwrite(output_path, hdr_output[:, :, ::-1].astype(np.float32))
+            print(f"  Saved: {output_path}")
+        
+        # Optional: Merge the two HDR results
+        if args.merge_pairs:
+            print(f"\nMerging pairs for scene {scene}...")
+            hdr_merged = merge_hdr_pairs(
+                hdr_results["pair_1-0"], 
+                hdr_results["pair_1-2"],
+                method=args.merge_method  # 'average', 'max', 'weighted'
+            )
+            merged_path = os.path.join(args.save_dir, f"{scene}_merged.hdr")
+            cv2.imwrite(merged_path, hdr_merged[:, :, ::-1].astype(np.float32))
+            print(f"  Saved merged: {merged_path}")
             
-            # 1. Raw model output (first tile, before any processing)
-            if raw_outputs_sample:
-                raw_first = raw_outputs_sample[0].cpu().numpy()
-                print(f'  1. Raw model output (first tile, log space):')
-                print(f'     Range: [{raw_first.min():.4f}, {raw_first.max():.4f}]')
-                print(f'     Mean: {raw_first.mean():.4f}, Std: {raw_first.std():.4f}')
-            
-            # 2. After expm1 transformation
-            print(f'  2. After expm1 (linear HDR space):')
-            print(f'     Range: [{out_final.min().item():.4f}, {out_final.max().item():.4f}]')
-            print(f'     Mean: {out_final.mean().item():.4f}')
-            
-            # 3. Ground truth HDR
-            print(f'  3. Ground truth HDR:')
-            print(f'     Range: [{gt_hdr.min():.4f}, {gt_hdr.max():.4f}]')
-            print(f'     Mean: {gt_hdr.mean():.4f}')
-            print(f'  {"="*60}\n')
+            # Compute metrics on merged result
+            if args.compute_metrics:
+                gt_np = gt_hdr if isinstance(gt_hdr, np.ndarray) else gt_hdr.cpu().numpy()
+                compute_and_print_metrics(hdr_merged, gt_np, f"Scene {scene} (merged)")
+        
+        # Compute metrics for individual pairs
+        if args.compute_metrics:
+            gt_np = gt_hdr if isinstance(gt_hdr, np.ndarray) else gt_hdr.cpu().numpy()
+            for pair_name, hdr_output in hdr_results.items():
+                compute_and_print_metrics(hdr_output, gt_np, f"Scene {scene} ({pair_name})")
 
-        output_np = np.clip(output_np, 0, None)  # Only clip negatives
-
-        # Save HDR (use imageio to match training)
-        imageio.imwrite(
-            os.path.join(args.save_dir, f'output_{idx+1}.hdr'),
-            output_np.astype(np.float32)
-        )
-
-        # ============================================================
-        # METRICS: Use tone mapping for fair comparison
-        # ============================================================
-        sr_tm_for_metrics = output_np / (1.0 + output_np)
-        sr_tm_for_metrics = np.clip(sr_tm_for_metrics, 0, 1)
-        
-        gt_tm_for_metrics = gt_hdr / (1.0 + gt_hdr)
-        gt_tm_for_metrics = np.clip(gt_tm_for_metrics, 0, 1)
-        
-        sr_tm_tensor = torch.from_numpy(sr_tm_for_metrics).permute(2, 0, 1).unsqueeze(0).to(args.device)
-        gt_tm_tensor = torch.from_numpy(gt_tm_for_metrics).permute(2, 0, 1).unsqueeze(0).to(args.device)
-        
-        ssim_val, psnr_val = compute_metrics(sr_tm_tensor, gt_tm_tensor)
-        
-        # ============================================================
-        # VISUALIZATION: Apply exposure and tone mapping for PNG
-        # ============================================================
-        if args.auto_exposure:
-            percentile_val = np.percentile(output_np, 95)
-            if percentile_val > 0:
-                exposure_scale = args.target_brightness / percentile_val
-                output_exposed = output_np * exposure_scale
-            else:
-                output_exposed = output_np
-        else:
-            output_exposed = output_np * args.exposure
-        
-        # Apply tone mapping for visualization
-        if args.tonemap_method == 'reinhard':
-            tm = output_exposed / (1.0 + output_exposed)
-        elif args.tonemap_method == 'gamma':
-            normalized = np.clip(output_exposed / np.percentile(output_exposed, 99), 0, 1)
-            tm = np.power(normalized, 1.0/args.gamma)
-        elif args.tonemap_method == 'log':
-            tm = np.log(1 + output_exposed * args.log_scale) / np.log(1 + args.log_scale)
-        elif args.tonemap_method == 'aces':
-            a = 2.51
-            b = 0.03
-            c = 2.43
-            d = 0.59
-            e = 0.14
-            tm = np.clip((output_exposed * (a * output_exposed + b)) / 
-                        (output_exposed * (c * output_exposed + d) + e), 0, 1)
-        else:  # 'simple'
-            tm = np.clip(output_exposed / np.percentile(output_exposed, 99.5), 0, 1)
-        
-        tm = np.clip(tm, 0, 1)
-        
-        if args.output_gamma != 1.0:
-            tm = np.power(tm, 1.0 / args.output_gamma)
-
-        cv2.imwrite(
-            os.path.join(args.save_dir, f'output_{idx+1}_tm.png'),
-            (tm[..., ::-1] * 255).astype(np.uint8)
-        )
-        
-        print(f'Sample {idx+1}: SSIM={ssim_val:.4f}, PSNR={psnr_val:.2f} dB')
-        
-        # Save debug visualization
-        if args.save_debug:
-            import matplotlib.pyplot as plt
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            
-            # Row 1: Comparison for metrics
-            axes[0, 0].imshow(sr_tm_for_metrics)
-            axes[0, 0].set_title(f'Output (Reinhard TM)\nSSIM={ssim_val:.4f}')
-            axes[0, 0].axis('off')
-            
-            axes[0, 1].imshow(gt_tm_for_metrics)
-            axes[0, 1].set_title('Ground Truth (Reinhard TM)')
-            axes[0, 1].axis('off')
-            
-            diff_metrics = np.abs(sr_tm_for_metrics - gt_tm_for_metrics)
-            axes[0, 2].imshow(diff_metrics)
-            axes[0, 2].set_title(f'Difference\nMean: {diff_metrics.mean():.4f}')
-            axes[0, 2].axis('off')
-            
-            # Row 2: Visualization and analysis
-            axes[1, 0].imshow(tm)
-            axes[1, 0].set_title(f'Output (exposure-adjusted)\n{args.tonemap_method.upper()} TM')
-            axes[1, 0].axis('off')
-            
-            # HDR histograms (log scale)
-            axes[1, 1].hist(output_np.flatten(), bins=100, color='blue', alpha=0.7, label='Output HDR')
-            axes[1, 1].hist(gt_hdr.flatten(), bins=100, color='green', alpha=0.5, label='GT HDR')
-            axes[1, 1].set_title('HDR Value Distribution')
-            axes[1, 1].set_xlabel('HDR Value')
-            axes[1, 1].set_ylabel('Count (log scale)')
-            axes[1, 1].set_yscale('log')
-            axes[1, 1].legend()
-            
-            # Tone-mapped histograms
-            axes[1, 2].hist(sr_tm_for_metrics.flatten(), bins=100, color='blue', alpha=0.7, label='Output TM')
-            axes[1, 2].hist(gt_tm_for_metrics.flatten(), bins=100, color='green', alpha=0.5, label='GT TM')
-            axes[1, 2].set_title('Tone-Mapped Value Distribution')
-            axes[1, 2].set_xlabel('Value')
-            axes[1, 2].set_ylabel('Count')
-            axes[1, 2].legend()
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(args.save_dir, f'debug_{idx+1}.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            # Print statistics
-            print(f'  Output HDR range: [{output_np.min():.4f}, {output_np.max():.4f}], mean: {output_np.mean():.4f}')
-            print(f'  GT HDR range: [{gt_hdr.min():.4f}, {gt_hdr.max():.4f}], mean: {gt_hdr.mean():.4f}')
-        
-        # Clear scene data from GPU
-        del t1, t2, sum1, sum2, ldr_long_t, ldr_short_t
-        del ldr_long_pad, ldr_short_pad, out_acc, w_acc, out_final
-        if args.device == 'cuda':
-            torch.cuda.empty_cache()
-
+    print("\n" + "="*80)
     print("All scenes processed.")
+    print("="*80)
 
+
+def merge_hdr_pairs(hdr1, hdr2, method='weighted'):
+    """
+    Merge two HDR images from different exposure pairs.
+    
+    Args:
+        hdr1: HDR from (middle, dark) pair - better for bright regions
+        hdr2: HDR from (middle, bright) pair - better for dark regions
+        method: 'average', 'max', 'weighted', or 'adaptive'
+    """
+    if method == 'average':
+        return (hdr1 + hdr2) / 2.0
+    
+    elif method == 'max':
+        # Take maximum value at each pixel (preserves brightest)
+        return np.maximum(hdr1, hdr2)
+    
+    elif method == 'weighted':
+        # Weight based on intensity - dark pair for highlights, bright pair for shadows
+        luminance1 = 0.2126 * hdr1[..., 0] + 0.7152 * hdr1[..., 1] + 0.0722 * hdr1[..., 2]
+        luminance2 = 0.2126 * hdr2[..., 0] + 0.7152 * hdr2[..., 1] + 0.0722 * hdr2[..., 2]
+        
+        # Create weights: use hdr1 (with dark) for bright regions, hdr2 (with bright) for dark regions
+        # Normalize luminances
+        lum1_norm = luminance1 / (luminance1 + luminance2 + 1e-6)
+        lum2_norm = luminance2 / (luminance1 + luminance2 + 1e-6)
+        
+        # Apply weights
+        weight1 = lum1_norm[..., None]
+        weight2 = lum2_norm[..., None]
+        
+        return hdr1 * weight1 + hdr2 * weight2
+    
+    elif method == 'adaptive':
+        # Adaptive merging: use confidence based on which pair should perform better
+        # hdr1 (middle+dark) is better for bright regions
+        # hdr2 (middle+bright) is better for dark regions
+        
+        intensity_threshold = 128.0  # Crossover point
+        
+        # Compute average intensity
+        avg_intensity1 = (hdr1[..., 0] + hdr1[..., 1] + hdr1[..., 2]) / 3.0
+        avg_intensity2 = (hdr2[..., 0] + hdr2[..., 1] + hdr2[..., 2]) / 3.0
+        
+        # Create smooth transition weights
+        # Sigmoid function for smooth blending
+        x = (avg_intensity1 + avg_intensity2) / 2.0
+        weight1 = 1.0 / (1.0 + np.exp(-0.05 * (x - intensity_threshold)))
+        weight2 = 1.0 - weight1
+        
+        weight1 = weight1[..., None]
+        weight2 = weight2[..., None]
+        
+        return hdr1 * weight1 + hdr2 * weight2
+    
+    else:
+        raise ValueError(f"Unknown merge method: {method}")
+
+
+def compute_and_print_metrics(pred_hdr, gt_hdr, label=""):
+    """Compute and print PSNR and SSIM metrics."""
+    from skimage.metrics import structural_similarity as ssim
+    from skimage.metrics import peak_signal_noise_ratio as psnr
+    
+    # Ensure same shape
+    if pred_hdr.shape != gt_hdr.shape:
+        print(f"  Warning: Shape mismatch for {label}")
+        return
+    
+    # Clip predictions to valid range
+    pred_hdr_clipped = np.clip(pred_hdr, 0, 255)
+    
+    # Compute metrics
+    psnr_val = psnr(gt_hdr, pred_hdr_clipped, data_range=255.0)
+    ssim_val = ssim(gt_hdr, pred_hdr_clipped, data_range=255.0, channel_axis=2)
+    
+    print(f"\n  [{label}]")
+    print(f"  PSNR: {psnr_val:.2f} dB")
+    print(f"  SSIM: {ssim_val:.4f}")
+    print(f"  Output range: [{pred_hdr.min():.2f}, {pred_hdr.max():.2f}]")
+    print(f"  GT range: [{gt_hdr.min():.2f}, {gt_hdr.max():.2f}]")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -523,6 +362,19 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=2.2)
     parser.add_argument('--log_scale', type=float, default=1.0)
     parser.add_argument('--save_debug', action='store_true')
+    parser.add_argument('--merge_pairs', action='store_true', 
+                    help='Merge the two HDR pairs into a single result')
+
+    parser.add_argument('--merge_method', type=str, default='adaptive',
+                        choices=['average', 'max', 'weighted', 'adaptive'],
+                        help='Method for merging HDR pairs: '
+                            'average (simple mean), '
+                            'max (take brightest), '
+                            'weighted (luminance-based), '
+                            'adaptive (intensity-based sigmoid)')
+
+    parser.add_argument('--compute_metrics', action='store_true',
+                        help='Compute PSNR and SSIM metrics against ground truth')
     args = parser.parse_args()
 
     test(args)

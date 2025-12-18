@@ -4,7 +4,7 @@ from torchinfo import summary
 import torch.nn.functional as F
 from model.fusion_mamba import FusionMamba
 from mamba_ssm.modules.mamba_simple import Mamba
-
+import math
 
 class PixelShuffle(nn.Module):
     def __init__(self, dim, scale):
@@ -108,122 +108,103 @@ class SpeAttention(nn.Module):
 
 
 class U2Net(nn.Module):
-    def __init__(self, dim, img1_dim, img2_dim, H=64, W=64, scale=4):
+    def __init__(self, dim, img1_dim, img2_dim, H=64, W=64):
         super().__init__()
 
-        # self.upsample = PixelShuffle(img2_dim, scale)
-        self.raise_img1_dim = nn.Sequential(
+        # ---------- Input lifting ----------
+        self.raise_img1 = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
-            nn.LeakyReLU()
+            nn.LeakyReLU(inplace=True)
         )
-        self.raise_img2_dim = nn.Sequential(
+        self.raise_img2 = nn.Sequential(
             nn.Conv2d(img2_dim, dim, 3, 1, 1),
-            nn.LeakyReLU()
+            nn.LeakyReLU(inplace=True)
         )
-        
-        self.raise_img1_sum_dim = nn.Sequential(
+        self.raise_sum1 = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
-            nn.LeakyReLU()
+            nn.LeakyReLU(inplace=True)
         )
-        self.raise_img2_sum_dim = nn.Sequential(
+        self.raise_sum2 = nn.Sequential(
             nn.Conv2d(img2_dim, dim, 3, 1, 1),
-            nn.LeakyReLU()
+            nn.LeakyReLU(inplace=True)
         )
-        
-        
-        self.to_hrimg2 = nn.Sequential(
+
+        # ---------- Main backbone ----------
+        dim0, dim1, dim2 = dim, dim * 2, dim * 4
+        self.stage0 = Stage(dim0, dim1, H, W, sample_mode='down')
+        self.stage1 = Stage(dim1, dim2, H // 2, W // 2, sample_mode='down')
+        self.stage2 = Stage(dim2, dim1, H // 4, W // 4, sample_mode='up')
+        self.stage3 = Stage(dim1, dim0, H // 2, W // 2, sample_mode='up')
+        self.stage4 = FusionMamba(dim0, H, W, final=True)
+
+        # ---------- Output head ----------
+        self.to_hr = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.LeakyReLU(),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(dim, img2_dim, 3, 1, 1)
         )
 
-        # dimension for each stage
-        dim0 = dim
-        dim1 = int(dim0 * 2)
-        dim2 = int(dim1 * 2)
-
-        # main body
-        self.stage0 = Stage(dim0, dim1, H, W, sample_mode='down')
-        self.stage1 = Stage(dim1, dim2, H//2, W//2, sample_mode='down')
+        # ---------- Safe scale predictor ----------
+        self.scale_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(img1_dim + img2_dim, 64, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, img2_dim, 1)
+        )
         
-        self.stage2 = Stage(dim2, dim1, H//4, W//4, sample_mode='up')
-        self.stage3 = Stage(dim1, dim0, H//2, W//2, sample_mode='up')
-        self.stage4 = FusionMamba(dim0, H, W, final=True)
+        with torch.no_grad():
+            self.scale_net[-1].weight *= 0.01
+            self.scale_net[-1].bias.fill_(math.log(50.0))
 
-        self.img1_spe_attn = SpeAttention(dim)
-        self.img2_spe_attn = SpeAttention(dim)
-        
-        self.skip_converter = nn.Sequential(
+        # ---------- Skip (residual, not competing) ----------
+        self.skip_conv = nn.Sequential(
             nn.Conv2d(img1_dim, img2_dim, 1),
-            nn.LeakyReLU()
+            nn.LeakyReLU(inplace=True)
         )
- 
-        self.output_scale_conv = nn.Conv2d(img2_dim, img2_dim, 1, bias=False, groups=img2_dim)
-        # Initialize to 0.1 (acts like a per-channel scale)
-        nn.init.constant_(self.output_scale_conv.weight, 0.1)
-        
-        skip_in_channels = img1_dim + img2_dim
-        skip_mid = max(1, dim // 2)
 
-        self.skip_gate = nn.Sequential(
-            nn.Conv2d(skip_in_channels, dim, 3, 1, 1),
+        self.skip_scale_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(img1_dim, 32, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(dim, skip_mid, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(skip_mid, 1, 1),
-            nn.Sigmoid()
+            nn.Conv2d(32, 1, 1)
         )
-        self.skip_alpha_param = nn.Parameter(torch.tensor(0.0))
+
+        with torch.no_grad():
+            self.skip_scale_net[-1].weight *= 0.01
+            self.skip_scale_net[-1].bias.fill_(math.log(30.0))
 
     def forward(self, img1, img2, sum1, sum2):
-        org_img1 = img1
-        org_img2 = img2
-        # img2 = self.upsample(img2)
-        img1 = self.raise_img1_dim(img1)
-        img2 = self.raise_img2_dim(img2)
-        
-        sum1 = self.raise_img1_sum_dim(sum1)
-        sum2 = self.raise_img2_sum_dim(sum2)
+        org1, org2 = img1, img2
 
-        # main body
-        img1, img2, sum1, sum2, img1_skip0, img2_skip0 = self.stage0(img1, img2, sum1, sum2)
-        img1, img2, sum1, sum2, img1_skip1, img2_skip1 = self.stage1(img1, img2, sum1, sum2)
-        
-        img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, img1_skip1, img2_skip1)
-        img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
-        output = self.stage4(img1, img2, sum1, sum2)
+        # ---------- Adaptive scale ----------
+        scale_input = torch.cat([org1, org2], dim=1)
+        log_scale = self.scale_net(scale_input)
+        adaptive_scale = torch.exp(log_scale).clamp(1e-3, 300.0)
 
-        # decoder → RGB
-        output = self.to_hrimg2(output)
+        skip_log_scale = self.skip_scale_net(org1)
+        skip_scale = torch.exp(skip_log_scale).clamp(1e-3, 300.0)
 
-        # enforce positivity & learned scale for linear radiance (softplus + small scale)
-        # keep a small init for output_scale in __init__ like: self.output_scale = nn.Parameter(torch.ones(1,img2_dim,1,1)*0.1)
-        # safe_scale = torch.clamp(self.output_scale, max=10.0)  # avoid runaway amplification
-        
-        linear = F.softplus(output) + 1e-6
-        linear = self.output_scale_conv(linear)       # (B, C, H, W), > 0
+        # ---------- Backbone ----------
+        img1 = self.raise_img1(img1)
+        img2 = self.raise_img2(img2)
+        sum1 = self.raise_sum1(sum1)
+        sum2 = self.raise_sum2(sum2)
 
-        # spectral attention: average and clamp so it doesn't amplify >1
-        img1_spe_attn = self.img1_spe_attn(org_img1)
-        img2_spe_attn = self.img2_spe_attn(org_img2)
-        att = (img1_spe_attn + img2_spe_attn)
-        # att = torch.clamp(att, 0.0, 1.0)
-        linear = linear * att   # multiply in linear domain
+        img1, img2, sum1, sum2, s0_1, s0_2 = self.stage0(img1, img2, sum1, sum2)
+        img1, img2, sum1, sum2, s1_1, s1_2 = self.stage1(img1, img2, sum1, sum2)
+        img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, s1_1, s1_2)
+        img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, s0_1, s0_2)
 
-        # prepare skip (in linear domain), do NOT log1p() the skip here
-        converted_skip = self.skip_converter(org_img1)    # (B, C, H, W)
-        converted_skip = F.softplus(converted_skip) + 1e-6
+        feat = self.stage4(img1, img2, sum1, sum2)
+        pred = self.to_hr(feat)
 
-        # Gate: build gate input with both terms IN THE SAME (linear) DOMAIN
-        gate_in = torch.cat([converted_skip, linear], dim=1)   # (B, 2*C, H, W)
-        gate = self.skip_gate(gate_in)                        # (B, 1, H, W)
+        # ---------- Linear HDR ----------
+        pred = F.softplus(pred) * adaptive_scale
 
-        skip_alpha = torch.sigmoid(self.skip_alpha_param)
+        # ---------- Residual skip ----------
+        skip = F.softplus(self.skip_conv(org1)) * skip_scale
+        output_linear = pred + skip
 
-        # Combine in linear domain
-        output_lin = linear * (1.0 - skip_alpha * gate) + skip_alpha * gate * converted_skip
-        output_lin = torch.clamp(output_lin, min=0.0)   # defensive
+        output_log = torch.log1p(output_linear)
 
-        # Finally: return log1p(linear) so training (and your test expm1) are consistent
-        out = torch.log1p(output_lin + 1e-6)
-        return out
+        return output_log, output_linear, adaptive_scale, skip_scale

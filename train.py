@@ -13,7 +13,7 @@ import torch.backends.cudnn as cudnn
 from torchinfo import summary
 from torch.utils.data import DataLoader
 
-from utils.tools import ERGAS
+from utils.tools import compute_hdr_loss
 from model.u2net import U2Net as Net
 from utils.hdr_load_train_data import HDRDatasetMaxPerf
 import cv2
@@ -111,7 +111,6 @@ def prepare_training_data(args):
     print(f"  Tile size: {tile_h}x{tile_w}")
     print(f"  Stride: {stride_h}x{stride_w}")
     print(f"\nOptimization Features:")
-    print(f"  Half precision (fp16): {args.use_half}")
     print(f"  Parallel load threads: {args.num_load_threads}")
     print(f"  Disk cache: {args.use_disk_cache}")
     if args.use_disk_cache:
@@ -156,7 +155,6 @@ def prepare_training_data(args):
         split='train',
         split_scenes=train_scenes,
         max_cached_pairs=args.max_cached_pairs,
-        # use_half=args.use_half,
         num_load_threads=args.num_load_threads,
         use_disk_cache=args.use_disk_cache,
         disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
@@ -179,18 +177,6 @@ def prepare_training_data(args):
     
     return training_data_loader, train_set
 
-def reinhard_tonemap(hdr_image, eps=1e-8):
-    """
-    Apply Reinhard tone mapping to HDR image.
-    Args:
-        hdr_image: HDR image tensor in LINEAR space (B, C, H, W)
-        eps: small value to avoid division by zero
-    Returns:
-        Tone-mapped image in [0, 1] range
-    """
-    # Reinhard tone mapping: TM = L / (1 + L)
-    return hdr_image / (1.0 + hdr_image)
-
 
 def train(args, training_data_loader, train_set):
     """Main training loop with fixed HDR loss."""
@@ -201,8 +187,7 @@ def train(args, training_data_loader, train_set):
         args.first_channels,
         args.second_channels,
         args.H,
-        args.W,
-        args.ratio
+        args.W
     ).to(args.device)
 
     # Multi-GPU support
@@ -222,13 +207,13 @@ def train(args, training_data_loader, train_set):
         ],
         dtypes=[torch.float, torch.float, torch.float, torch.float]
     )
-
-    # Loss functions
-    criterion_hdr = nn.SmoothL1Loss(beta=0.1).to(args.device)
-    criterion_perceptual = nn.L1Loss().to(args.device)
-
+    
     # Optimizer and LR scheduler
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
+    optimizer = torch.optim.AdamW([
+        {"params": [p for n,p in model.named_parameters() if "scale_net" not in n], "lr": args.lr},
+        {"params": model.scale_net.parameters(), "lr": args.lr * 0.1},
+        {"params": model.skip_scale_net.parameters(), "lr": args.lr * 0.1},
+    ])
     num_epochs_to_run = args.epoch
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -250,103 +235,60 @@ def train(args, training_data_loader, train_set):
 
     print(f"\nTraining from epoch {start_epoch} to {args.epoch}")
     print("=" * 80)
-    
-    perceptual_weight = getattr(args, 'perceptual_weight', 0.25)
-    bias_weight = 0.02        # start small (0.01–0.05)
-    linear_weight = 1e-3      # optional but recommended
-
     t_start = time.time()
 
     try:
         for epoch in range(start_epoch, args.epoch + 1):
             model.train()
-            epoch_loss = []
-            epoch_loss_perceptual = []
 
             for iteration, batch in enumerate(training_data_loader, 1):
                 gt, ldr1, ldr2, sum1, sum2 = [x.to(args.device) for x in batch]
 
                 optimizer.zero_grad()
-                sr_log = model(ldr1, ldr2, sum1, sum2)
+                sr_log, sr_linear, adaptive_scale, skip_scale = model(ldr1, ldr2, sum1, sum2)
 
-                gt_safe = torch.clamp(gt, min=1e-4)
-                target_log = torch.log1p(gt_safe)
-
-                # HDR loss (main)
-                loss_hdr = criterion_hdr(sr_log, target_log)
-
-                # Bias anchoring (log-space mean)
-                mean_diff = (sr_log - target_log).mean()
-                loss_bias = torch.abs(mean_diff)
-
-                # Optional: absolute scale stabilization (linear space)
-                sr_linear = torch.expm1(sr_log)
-                loss_linear = torch.nn.functional.l1_loss(sr_linear, gt_safe)
-
-                # Perceptual (tone-mapped)
-                sr_tm = reinhard_tonemap(sr_linear.detach())
-                gt_tm = reinhard_tonemap(gt)
-                loss_perceptual = criterion_perceptual(sr_tm, gt_tm)
-
-                # Total loss
-                loss = (
-                    loss_hdr
-                    + perceptual_weight * loss_perceptual
-                    + bias_weight * loss_bias
-                    + linear_weight * loss_linear
+                target_log = torch.log1p(gt)
+                
+                loss = compute_hdr_loss(
+                    sr_log, target_log, sr_linear, gt,
+                    adaptive_scale, skip_scale,
+                    epoch=(iteration + epoch * len(training_data_loader))//10
                 )
+
+                
                 # Backward and optimize
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 lr_scheduler.step()
-                
-                # with torch.no_grad():
-                #     m = model.module if hasattr(model, 'module') else model
-                #     if hasattr(m, 'output_scale'):
-                #         m.output_scale.clamp_(0.0, 5.0)
 
-                epoch_loss.append(loss_hdr.item())
-                epoch_loss_perceptual.append(loss_perceptual.item())
-                with torch.no_grad():
-                    log_bias_val = mean_diff.item()
-                    sr_mean = sr_linear.mean().item()
-                    gt_mean = gt_safe.mean().item()
-                    scale_ratio = sr_mean / (gt_mean + 1e-6)
                 # Progress printing
                 if iteration % args.print_freq == 0:
                     print(
                         f'Epoch {epoch}/{args.epoch} | '
                         f'Iter {iteration}/{len(training_data_loader)} | '
-                        f'HDR: {loss_hdr.item():.5f} | '
-                        f'Perc: {loss_perceptual.item():.5f} | '
-                        f'Bias: {loss_bias.item():.4f} | '
-                        f'LogΔ: {log_bias_val:+.3f} | '
-                        f'Scale×: {scale_ratio:.2f} | '
+                        f'total_loss: {loss.item():.4f} | '
                         f'LR: {optimizer.param_groups[0]["lr"]:.2e}'
                     )
+                    print(f'  sr_linear: min={sr_linear.min():.4f}, max={sr_linear.max():.4f}, mean={sr_linear.mean():.4f}')
+                    print(f'  gt: min={gt.min():.4f}, max={gt.max():.4f}, mean={gt.mean():.4f}')
+                                
+                    print(f'{"-"*80}\n')
 
                 # Checkpoint every 200 iterations
                 if iteration % 200 == 0:
                     save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
                     print(f"\nCheckpoint saved at iteration {iteration + epoch}!")
 
-            # Epoch summary
-            print(f'\nEpoch {epoch} Summary:')
-            print(f'  HDR Loss: {np.nanmean(epoch_loss):.6f}')
-            print(f'  Perceptual Loss: {np.nanmean(epoch_loss_perceptual):.6f}')
 
             print(f'\n{"="*80}')
             print(f'Time elapsed: {time.time() - t_start:.2f}s')
             print(f'{"="*80}\n')
             t_start = time.time()
 
-            # Epoch checkpoint
-            if epoch % args.ckpt == 0:
-                save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
+            save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
 
         # Final checkpoint
-        save_checkpoint(args, model, optimizer, lr_scheduler, args.epoch)
+        # save_checkpoint(args, model, optimizer, lr_scheduler, args.epoch)
         print("\nTraining completed!")
 
     finally:
@@ -392,8 +334,6 @@ if __name__ == "__main__":
                         help='Number of data loader workers')
 
     # DataLoader optimization features
-    parser.add_argument('--use_half', action='store_true',
-                        help='Use fp16 storage for 50%% memory reduction')
     parser.add_argument('--summary_only', type=bool, default=True)
     parser.add_argument('--disk_max_size_bytes', type=int, default=5 * (1024 ** 3))
     parser.add_argument('--num_load_threads', type=int, default=4,
