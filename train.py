@@ -210,14 +210,15 @@ def train(args, training_data_loader, train_set):
     
     # Optimizer and LR scheduler
     optimizer = torch.optim.AdamW([
-        {
+    {
         "params": [p for n, p in raw_model.named_parameters()
                    if "scale_net" not in n and "skip_scale_net" not in n],
         "lr": args.lr
-        },
-        {"params": model.scale_net.parameters(), "lr": args.lr * 0.1},
-        {"params": model.skip_scale_net.parameters(), "lr": args.lr * 0.1},
-    ])
+    },
+    {"params": raw_model.scale_net.parameters(), "lr": args.lr * 0.1},
+    {"params": raw_model.skip_scale_net.parameters(), "lr": args.lr * 0.1},
+])
+
     num_epochs_to_run = args.epoch
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -402,3 +403,4 @@ if __name__ == "__main__":
     training_data_loader, train_set = prepare_training_data(args)
 
     train(args, training_data_loader, train_set)
+
