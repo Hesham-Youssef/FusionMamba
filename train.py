@@ -252,12 +252,13 @@ def train(args, training_data_loader, train_set):
                 loss = compute_hdr_loss(
                     sr_log, target_log, sr_linear, gt,
                     adaptive_scale, skip_scale,
-                    epoch=(iteration + epoch * len(training_data_loader))//10
+                    epoch=(iteration + epoch * len(training_data_loader))//100
                 )
 
                 
                 # Backward and optimize
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 lr_scheduler.step()
 

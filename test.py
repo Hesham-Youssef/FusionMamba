@@ -27,6 +27,118 @@ import imageio.v2 as imageio
 # Import optimized tiling functions
 from utils.tools import compute_summary_fast, extract_tiles_optimized, make_hann_window, load_image_fast, prepare_tensors_for_inference
 
+
+import matplotlib
+matplotlib.use('Agg')   # non-interactive backend for servers
+import matplotlib.pyplot as plt
+import json
+
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def save_np_hist(bins, hist, path):
+    np.savez(path, bins=bins, hist=hist)
+
+def save_pair_diagnostics(scene, pair_name, pred_hdr, gt_hdr, save_dir, prefix=""):
+    """
+    pred_hdr, gt_hdr: HxWx3 numpy float32 arrays in linear HDR units (same shape)
+    Saves:
+      - hist (pred vs gt)
+      - cdf (quantiles)
+      - percentile scatter
+      - spatial error heatmap
+      - small JSON summary with numeric metrics
+    """
+    out_dir = _ensure_dir(os.path.join(save_dir, "diagnostics", scene))
+    base = f"{prefix}{pair_name}"
+
+    # Flatten luminance per pixel (use Rec.709-ish luminance)
+    lum_pred = (0.2126 * pred_hdr[...,0] + 0.7152 * pred_hdr[...,1] + 0.0722 * pred_hdr[...,2]).ravel()
+    lum_gt   = (0.2126 * gt_hdr[...,0]   + 0.7152 * gt_hdr[...,1]   + 0.0722 * gt_hdr[...,2]).ravel()
+
+    # Range for hist bins (cover slightly beyond GT)
+    max_v = max(np.percentile(lum_gt, 99.999), np.percentile(lum_pred, 99.999), 300.0)
+    min_v = 0.0
+    bins = np.linspace(min_v, max_v, 200)
+
+    # Histograms
+    hist_gt, _ = np.histogram(lum_gt, bins=bins)
+    hist_pred, _ = np.histogram(lum_pred, bins=bins)
+
+    # Save histogram arrays
+    save_np_hist(bins, {'gt': hist_gt, 'pred': hist_pred}, os.path.join(out_dir, f"{base}_hist.npz"))
+
+    # Overlaid histogram plot
+    plt.figure(figsize=(8,4))
+    plt.plot(bins[:-1], hist_gt, label='GT hist', linewidth=1)
+    plt.plot(bins[:-1], hist_pred, label='Pred hist', linewidth=1)
+    plt.xlabel("Luminance")
+    plt.ylabel("Count")
+    plt.title(f"{scene} | {pair_name} — Histogram")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{base}_hist.png"), dpi=150)
+    plt.close()
+
+    # CDF / quantiles
+    qs = np.linspace(0.0, 1.0, 101)
+    q_pred = np.quantile(lum_pred, qs)
+    q_gt = np.quantile(lum_gt, qs)
+
+    plt.figure(figsize=(6,4))
+    plt.plot(qs*100, q_gt, label='GT quantiles')
+    plt.plot(qs*100, q_pred, label='Pred quantiles')
+    plt.xlabel("Percentile")
+    plt.ylabel("Luminance")
+    plt.title(f"{scene} | {pair_name} — Quantile Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{base}_quantiles.png"), dpi=150)
+    plt.close()
+
+    # Percentile scatter (x=GT q, y=Pred q)
+    plt.figure(figsize=(5,5))
+    plt.scatter(q_gt, q_pred, s=6)
+    max_xy = max(q_gt.max(), q_pred.max())
+    plt.plot([0, max_xy], [0, max_xy], 'k--', linewidth=0.8)
+    plt.xlabel("GT quantile value")
+    plt.ylabel("Pred quantile value")
+    plt.title(f"{scene} | {pair_name} — Percentile scatter (close to diag = good)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{base}_pct_scatter.png"), dpi=150)
+    plt.close()
+
+    # Spatial error heatmap: signed-log of (pred - gt)
+    err = pred_hdr - gt_hdr
+    # Use luminance error for spatial map
+    lum_err = (0.2126*err[...,0] + 0.7152*err[...,1] + 0.0722*err[...,2])
+    # Signed log transform for nicer visualization
+    signed_log_err = np.sign(lum_err) * np.log1p(np.abs(lum_err))
+    plt.figure(figsize=(6,6))
+    plt.imshow(signed_log_err, cmap='viridis')
+    plt.colorbar(label='signed_log_error')
+    plt.title(f"{scene} | {pair_name} — Spatial signed-log error")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{base}_errmap.png"), dpi=150)
+    plt.close()
+
+    # small JSON summary
+    summary = {
+        'pair': pair_name,
+        'scene': scene,
+        'pred_min': float(lum_pred.min()), 'pred_max': float(lum_pred.max()), 'pred_mean': float(lum_pred.mean()),
+        'gt_min': float(lum_gt.min()), 'gt_max': float(lum_gt.max()), 'gt_mean': float(lum_gt.mean()),
+        'q95_pred': float(np.quantile(lum_pred, 0.95)), 'q99_pred': float(np.quantile(lum_pred, 0.99)),
+        'q95_gt': float(np.quantile(lum_gt, 0.95)), 'q99_gt': float(np.quantile(lum_gt, 0.99)),
+        'q99_gap': float(np.quantile(lum_gt, 0.99) - np.quantile(lum_pred, 0.99))
+    }
+    with open(os.path.join(out_dir, f"{base}_summary.json"), 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    # Return the summary dict so caller can collect per-scene stats
+    return summary
+
 def test(args):
     # Model load
     from model.u2net import U2Net as Net
@@ -314,30 +426,104 @@ def merge_hdr_pairs(hdr1, hdr2, method='weighted'):
     
     else:
         raise ValueError(f"Unknown merge method: {method}")
-
-
+    
+    
 def compute_and_print_metrics(pred_hdr, gt_hdr, label=""):
-    """Compute and print PSNR and SSIM metrics."""
+    """
+    Computes HDR metrics in TWO spaces:
+    1) Linear HDR (no clamp, no tonemap) → correctness
+    2) Tone-mapped HDR → perceptual quality
+
+    Reports:
+    - PSNR / SSIM (linear & tonemapped)
+    - Relative L1 error
+    - Highlight percentiles (q95 / q99 / q99.9)
+    - Max luminance error
+    """
+    import numpy as np
     from skimage.metrics import structural_similarity as ssim
     from skimage.metrics import peak_signal_noise_ratio as psnr
-    
-    # Ensure same shape
+
     if pred_hdr.shape != gt_hdr.shape:
         print(f"  Warning: Shape mismatch for {label}")
         return
-    
-    # Clip predictions to valid range
-    pred_hdr_clipped = np.clip(pred_hdr, 0, 255)
-    
-    # Compute metrics
-    psnr_val = psnr(gt_hdr, pred_hdr_clipped, data_range=255.0)
-    ssim_val = ssim(gt_hdr, pred_hdr_clipped, data_range=255.0, channel_axis=2)
-    
+
+    eps = 1e-6
+
+    # --- Linear luminance ---
+    lum_pred = (
+        0.2126 * pred_hdr[..., 0] +
+        0.7152 * pred_hdr[..., 1] +
+        0.0722 * pred_hdr[..., 2]
+    )
+    lum_gt = (
+        0.2126 * gt_hdr[..., 0] +
+        0.7152 * gt_hdr[..., 1] +
+        0.0722 * gt_hdr[..., 2]
+    )
+
+    # --- HDR-relative metrics (NO clamp) ---
+    rel_l1 = np.mean(np.abs(lum_pred - lum_gt) / (lum_gt + 1.0))
+    max_err = np.max(np.abs(lum_pred - lum_gt))
+
+    q95_p, q99_p, q999_p = np.quantile(lum_pred, [0.95, 0.99, 0.999])
+    q95_g, q99_g, q999_g = np.quantile(lum_gt,   [0.95, 0.99, 0.999])
+
+    # --- Linear PSNR / SSIM (NOT perceptual, diagnostic only) ---
+    max_linear = max(lum_gt.max(), eps)
+    psnr_linear = psnr(lum_gt, lum_pred, data_range=max_linear)
+    ssim_linear = ssim(
+        lum_gt, lum_pred,
+        data_range=max_linear,
+        gaussian_weights=True
+    )
+
+    # --- Tone-mapped PSNR / SSIM (perceptual) ---
+    pred_tm = np.log1p(np.clip(pred_hdr, 0.0, None))
+    gt_tm   = np.log1p(np.clip(gt_hdr,   0.0, None))
+
+    tm_max = max(pred_tm.max(), gt_tm.max(), eps)
+    pred_tm /= tm_max
+    gt_tm   /= tm_max
+
+    psnr_tm = psnr(gt_tm, pred_tm, data_range=1.0)
+    ssim_tm = ssim(gt_tm, pred_tm, data_range=1.0, channel_axis=2)
+
+    # --- Print ---
     print(f"\n  [{label}]")
-    print(f"  PSNR: {psnr_val:.2f} dB")
-    print(f"  SSIM: {ssim_val:.4f}")
-    print(f"  Output range: [{pred_hdr.min():.2f}, {pred_hdr.max():.2f}]")
-    print(f"  GT range: [{gt_hdr.min():.2f}, {gt_hdr.max():.2f}]")
+    print(f"  --- Linear HDR (no tonemap) ---")
+    print(f"  PSNR (linear): {psnr_linear:.2f} dB")
+    print(f"  SSIM (linear): {ssim_linear:.4f}")
+    print(f"  Relative L1:   {rel_l1:.5f}")
+    print(f"  Max error:    {max_err:.3f}")
+
+    print(f"\n  --- Tone-mapped HDR ---")
+    print(f"  PSNR (tm):    {psnr_tm:.2f} dB")
+    print(f"  SSIM (tm):    {ssim_tm:.4f}")
+
+    print(f"\n  --- Highlight percentiles ---")
+    print(f"  q95   pred / gt : {q95_p:.3f} / {q95_g:.3f}")
+    print(f"  q99   pred / gt : {q99_p:.3f} / {q99_g:.3f}")
+    print(f"  q99.9 pred / gt : {q999_p:.3f} / {q999_g:.3f}")
+
+    print(f"\n  Output range: [{pred_hdr.min():.2f}, {pred_hdr.max():.2f}]")
+    print(f"  GT range:     [{gt_hdr.min():.2f}, {gt_hdr.max():.2f}]")
+
+    return {
+        "psnr_linear": float(psnr_linear),
+        "ssim_linear": float(ssim_linear),
+        "psnr_tm": float(psnr_tm),
+        "ssim_tm": float(ssim_tm),
+        "rel_l1": float(rel_l1),
+        "max_err": float(max_err),
+        "q95_pred": float(q95_p),
+        "q95_gt": float(q95_g),
+        "q99_pred": float(q99_p),
+        "q99_gt": float(q99_g),
+        "q999_pred": float(q999_p),
+        "q999_gt": float(q999_g),
+    }
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
