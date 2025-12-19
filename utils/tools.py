@@ -429,8 +429,8 @@ class PerceptualLoss(nn.Module):
         super().__init__()
         # Use pre-trained VGG features
         try:
-            import torchvision.models as models
-            vgg = models.vgg16(pretrained=True).features
+            from torchvision.models import vgg16, VGG16_Weights
+            vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
             self.layers = nn.ModuleList([
                 vgg[:4],   # relu1_2
                 vgg[4:9],  # relu2_2
