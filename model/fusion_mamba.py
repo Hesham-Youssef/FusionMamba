@@ -13,15 +13,16 @@ class SingleMambaBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         # self.norm1 = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=8, bimamba_type='v6', 
+        self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v6', 
                            if_devide_out=True, use_norm=True, input_h=H, input_w=W)
-
+        self.post_norm = nn.LayerNorm(dim)
+        
     def forward(self, input):
         # input: (B, N, C)
         skip = input
         input = self.norm(input)
         output = self.block(input)
-        # output = self.norm1(output)
+        output = self.post_norm(output)
         return output + skip
 
 
@@ -30,50 +31,104 @@ class CrossMambaBlock(nn.Module):
         super().__init__()
         self.norm0 = nn.LayerNorm(dim)
         self.norm1 = nn.LayerNorm(dim)
-        # self.norm2 = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=8, bimamba_type='v7', 
+        self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v7', 
                            if_devide_out=True, use_norm=True, input_h=H, input_w=W)
+        self.post_norm = nn.LayerNorm(dim)
+        # Add cross-attention weighting
+        self.cross_weight = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
 
     def forward(self, input0, input1):
         # input0: (B, N, C) | input1: (B, N, C)
         skip = input0
-        input0 = self.norm0(input0)
-        input1 = self.norm1(input1)
-        output = self.block(input0, extra_emb=input1)
-        # output = self.norm2(output)
+        
+        input0_norm = self.norm0(input0)
+        input1_norm = self.norm1(input1)
+        
+        # Compute cross-attention weight
+        combined = torch.cat([input0_norm, input1_norm], dim=-1)
+        weight = self.cross_weight(combined)
+        
+        # Apply weighted fusion
+        output = self.block(input0_norm, extra_emb=input1_norm)
+        output = self.post_norm(output)
+        output = output * weight + input0_norm * (1 - weight)
+        
         return output + skip
 
-
 class FusionMamba(nn.Module):
-    def __init__(self, dim, H, W, depth=1, final=False):
+    """Enhanced FusionMamba with multi-stage fusion"""
+    def __init__(self, dim, H, W, depth=2, final=False):
         super().__init__()
         self.final = final
+        self.depth = depth
+        
+        # Spatial and spectral processing layers
         self.spa_mamba_layers = nn.ModuleList([])
         self.spe_mamba_layers = nn.ModuleList([])
+        
         for _ in range(depth):
             self.spa_mamba_layers.append(CrossMambaBlock(dim, H, W))
             self.spe_mamba_layers.append(CrossMambaBlock(dim, H, W))
+        
+        # Cross-fusion layers
         self.spa_cross_mamba = CrossMambaBlock(dim, H, W)
         self.spe_cross_mamba = CrossMambaBlock(dim, H, W)
-        self.out_proj = nn.Linear(dim, dim)
-
+        
+        # Self-attention for refinement
+        self.self_attn = SingleMambaBlock(dim, H, W)
+        
+        # Output projection with gating
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim)
+        )
+        
+        # Learnable fusion weights
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.ones(1))
+        
     def forward(self, img1, img2, img1_sum, img2_sum):
         b, c, h, w = img1.shape
+        
+        # Reshape to sequence format
         img1 = rearrange(img1, 'b c h w -> b (h w) c', h=h, w=w)
         img2 = rearrange(img2, 'b c h w -> b (h w) c', h=h, w=w)
         img1_sum = rearrange(img1_sum, 'b c h w -> b (h w) c', h=h, w=w)
         img2_sum = rearrange(img2_sum, 'b c h w -> b (h w) c', h=h, w=w)
+        
+        # Progressive fusion through layers
         for spa_layer, spe_layer in zip(self.spa_mamba_layers, self.spe_mamba_layers):
             img1 = spa_layer(img1, img1_sum)
             img2 = spe_layer(img2, img2_sum)
+        
+        # Cross-modal fusion
         spa_fusion = self.spa_cross_mamba(img1, img2)
         spe_fusion = self.spe_cross_mamba(img2, img1)
-        fusion = self.out_proj((spa_fusion + spe_fusion) / 2)
+        
+        # Weighted combination with learnable parameters
+        fusion = self.alpha * spa_fusion + self.beta * spe_fusion
+        fusion = fusion / (self.alpha + self.beta)  # Normalize
+        
+        # Self-refinement
+        fusion = self.self_attn(fusion)
+        
+        # Final projection
+        fusion = self.out_proj(fusion)
+        
+        # Reshape back
         img1 = rearrange(img1, 'b (h w) c -> b c h w', h=h, w=w)
         img2 = rearrange(img2, 'b (h w) c -> b c h w', h=h, w=w)
         output = rearrange(fusion, 'b (h w) c -> b c h w', h=h, w=w)
+        
         if self.final:
             return output
         else:
-            return (img1 + output) / 2, (img2 + output) /2
+            # Residual connections for stability
+            return (img1 + output) * 0.5, (img2 + output) * 0.5
+
 

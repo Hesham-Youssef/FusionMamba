@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
 import math
+import torch.nn as nn
+
 
 
 class ERGAS(torch.nn.Module):
@@ -344,103 +346,177 @@ def prepare_tensors_for_training(ldr1_np, ldr2_np, hdr_np):
     return t1, t2, tg
 
 
-import torch.nn.functional as F
-def compute_hdr_loss(sr_log, gt_log, sr_lin, gt_lin,
-                     adaptive_scale, skip_scale, epoch):
-
-    # ---------- Base reconstruction ----------
-    loss_main = F.smooth_l1_loss(sr_log, gt_log, beta=0.1)
-
-    # ---------- Percentile matching (KEY) ----------
-    percentiles = [0.90, 0.95, 0.99]
-    loss_pct = 0.0
-    for p in percentiles:
-        sr_p = torch.quantile(sr_lin.flatten(1), p, dim=1)
-        gt_p = torch.quantile(gt_lin.flatten(1), p, dim=1)
-        loss_pct += F.l1_loss(sr_p, gt_p) / (gt_p.mean() + 1.0)
-    loss_pct /= len(percentiles)
-
-    # ---------- Max highlight ----------
-    loss_max = F.l1_loss(
-        torch.amax(sr_lin, dim=(1, 2, 3)),
-        torch.amax(gt_lin, dim=(1, 2, 3))
-    ) / (gt_lin.mean() + 1.0)
-
-    # ---------- Mean + contrast ----------
-    loss_mean = F.l1_loss(sr_lin.mean(), gt_lin.mean()) / (gt_lin.mean() + 1.0)
-
-    loss_std = F.l1_loss(
-        sr_lin.flatten(1).std(dim=1).mean(),
-        gt_lin.flatten(1).std(dim=1).mean()
-    ) / (gt_lin.std() + 1.0)
-
-    # ---------- VERY weak scale regularization ----------
-    log_ad = torch.log(adaptive_scale + 1e-6).mean()
-    log_sk = torch.log(skip_scale + 1e-6).mean()
-
-    loss_scale = 0.01 * (
-        F.l1_loss(log_ad, torch.tensor(math.log(50.0), device=log_ad.device)) +
-        F.l1_loss(log_sk, torch.tensor(math.log(30.0), device=log_sk.device))
-    )
-
-    # ---------- Annealed weights ----------
-    w_pct = min(1.5, 0.5 + 0.1 * epoch)
-    w_max = min(2.0, 0.8 + 0.15 * epoch)
-
-    total_loss = (
-        2.0 * loss_main +
-        w_pct * loss_pct +
-        w_max * loss_max +
-        0.3 * loss_mean +
-        0.3 * loss_std +
-        loss_scale
-    )
-
-    return total_loss
-
-
-
-def compute_hdr_metrics(sr_linear, gt_linear):
-    """
-    Compute comprehensive metrics for monitoring training progress.
+class MultiScaleGradientLoss(nn.Module):
+    """Multi-scale gradient loss for preserving HDR details"""
+    def __init__(self, scales=[1, 2, 4]):
+        super().__init__()
+        self.scales = scales
+        
+    def gradient(self, x):
+        # Compute gradients in x and y directions
+        grad_x = torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:])
+        grad_y = torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :])
+        return grad_x, grad_y
     
-    Args:
-        sr_linear: Super-resolved output in linear space (B, C, H, W)
-        gt_linear: Ground truth in linear space (B, C, H, W)
+    def forward(self, pred, target):
+        loss = 0.0
+        for scale in self.scales:
+            if scale > 1:
+                pred_scaled = F.avg_pool2d(pred, scale)
+                target_scaled = F.avg_pool2d(target, scale)
+            else:
+                pred_scaled = pred
+                target_scaled = target
+            
+            pred_grad_x, pred_grad_y = self.gradient(pred_scaled)
+            target_grad_x, target_grad_y = self.gradient(target_scaled)
+            
+            loss += F.l1_loss(pred_grad_x, target_grad_x)
+            loss += F.l1_loss(pred_grad_y, target_grad_y)
+        
+        return loss / len(self.scales)
+
+
+class ToneMappedLoss(nn.Module):
+    """Loss in tone-mapped space for perceptual quality"""
+    def __init__(self, gamma=2.2):
+        super().__init__()
+        self.gamma = gamma
+        
+    def tone_map(self, x):
+        # Simple Reinhard tone mapping
+        # First convert from log space
+        x_linear = torch.expm1(x).clamp(min=0)
+        # Apply tone mapping
+        x_tm = x_linear / (1.0 + x_linear)
+        # Gamma correction
+        x_tm = torch.pow(x_tm.clamp(min=1e-8), 1.0 / self.gamma)
+        return x_tm
     
-    Returns:
-        metrics: Dictionary of computed metrics
-    """
-    with torch.no_grad():
-        metrics = {
-            # Basic statistics
-            'sr_min': sr_linear.min().item(),
-            'sr_max': sr_linear.max().item(),
-            'sr_mean': sr_linear.mean().item(),
-            'sr_std': sr_linear.std().item(),
-            
-            'gt_min': gt_linear.min().item(),
-            'gt_max': gt_linear.max().item(),
-            'gt_mean': gt_linear.mean().item(),
-            'gt_std': gt_linear.std().item(),
-            
-            # Critical ratios
-            'range_ratio': (sr_linear.max() / (gt_linear.max() + 1e-8)).item(),
-            'mean_ratio': (sr_linear.mean() / (gt_linear.mean() + 1e-8)).item(),
-            
-            # Percentiles
-            'sr_p95': torch.quantile(sr_linear.flatten(1), 0.95, dim=1).mean().item(),
-            'gt_p95': torch.quantile(gt_linear.flatten(1), 0.95, dim=1).mean().item(),
-            'sr_p99': torch.quantile(sr_linear.flatten(1), 0.99, dim=1).mean().item(),
-            'gt_p99': torch.quantile(gt_linear.flatten(1), 0.99, dim=1).mean().item(),
+    def forward(self, pred_log, target_log):
+        pred_tm = self.tone_map(pred_log)
+        target_tm = self.tone_map(target_log)
+        
+        # L1 loss in tone-mapped space
+        l1_loss = F.l1_loss(pred_tm, target_tm)
+        
+        # SSIM-like loss
+        mu_pred = F.avg_pool2d(pred_tm, 3, 1, 1)
+        mu_target = F.avg_pool2d(target_tm, 3, 1, 1)
+        
+        mu_pred_sq = mu_pred * mu_pred
+        mu_target_sq = mu_target * mu_target
+        mu_pred_target = mu_pred * mu_target
+        
+        sigma_pred_sq = F.avg_pool2d(pred_tm * pred_tm, 3, 1, 1) - mu_pred_sq
+        sigma_target_sq = F.avg_pool2d(target_tm * target_tm, 3, 1, 1) - mu_target_sq
+        sigma_pred_target = F.avg_pool2d(pred_tm * target_tm, 3, 1, 1) - mu_pred_target
+        
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
+                   ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
+        
+        ssim_loss = 1 - ssim_map.mean()
+        
+        return l1_loss + 0.2 * ssim_loss
+
+
+class PerceptualLoss(nn.Module):
+    """Perceptual loss using VGG features"""
+    def __init__(self):
+        super().__init__()
+        # Use pre-trained VGG features
+        try:
+            import torchvision.models as models
+            vgg = models.vgg16(pretrained=True).features
+            self.layers = nn.ModuleList([
+                vgg[:4],   # relu1_2
+                vgg[4:9],  # relu2_2
+                vgg[9:16], # relu3_3
+            ])
+            for param in self.parameters():
+                param.requires_grad = False
+            self.use_vgg = True
+        except:
+            self.use_vgg = False
+            print("Warning: VGG not available, perceptual loss disabled")
+        
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+    
+    def normalize(self, x):
+        # Convert from log space to [0, 1]
+        x = torch.expm1(x).clamp(min=0)
+        x = x / (1.0 + x)  # Tone map
+        # Normalize for VGG
+        x = (x - self.mean) / self.std
+        return x
+    
+    def forward(self, pred_log, target_log):
+        if not self.use_vgg:
+            return 0.0
+        
+        pred = self.normalize(pred_log)
+        target = self.normalize(target_log)
+        
+        loss = 0.0
+        for layer in self.layers:
+            pred = layer(pred)
+            target = layer(target)
+            loss += F.l1_loss(pred, target)
+        
+        return loss
+
+
+class EnhancedHDRLoss(nn.Module):
+    """Comprehensive HDR loss combining multiple objectives"""
+    def __init__(self, lambda_l1=1.0, lambda_grad=0.5, lambda_tm=0.3, lambda_perc=0.1):
+        super().__init__()
+        self.lambda_l1 = lambda_l1
+        self.lambda_grad = lambda_grad
+        self.lambda_tm = lambda_tm
+        self.lambda_perc = lambda_perc
+        
+        self.gradient_loss = MultiScaleGradientLoss(scales=[1, 2, 4])
+        self.tonemapped_loss = ToneMappedLoss(gamma=2.2)
+        self.perceptual_loss = PerceptualLoss()
+    
+    def forward(self, pred_log, target_log):
+        # Base L1 loss in log domain
+        l1_loss = F.l1_loss(pred_log, target_log)
+        
+        # Gradient loss for detail preservation
+        grad_loss = self.gradient_loss(pred_log, target_log)
+        
+        # Tone-mapped perceptual loss
+        tm_loss = self.tonemapped_loss(pred_log, target_log)
+        
+        # Perceptual loss
+        perc_loss = self.perceptual_loss(pred_log, target_log)
+        
+        # Ensure no negative values in output
+        negative_penalty = torch.relu(-pred_log).mean() * 10.0
+        
+        # Dynamic range preservation
+        pred_range = pred_log.max() - pred_log.min()
+        target_range = target_log.max() - target_log.min()
+        range_loss = torch.abs(pred_range - target_range)
+        
+        # Combine losses
+        total_loss = (self.lambda_l1 * l1_loss + 
+                     self.lambda_grad * grad_loss + 
+                     self.lambda_tm * tm_loss +
+                     self.lambda_perc * perc_loss +
+                     negative_penalty +
+                     0.1 * range_loss)
+        
+        return total_loss, {
+            'l1': l1_loss.item(),
+            'grad': grad_loss.item(),
+            'tm': tm_loss.item(),
+            'perc': perc_loss.item() if isinstance(perc_loss, torch.Tensor) else 0.0,
+            'neg_penalty': negative_penalty.item(),
+            'range': range_loss.item()
         }
-    
-    return metrics
-
-def reinhard_tonemap(hdr, key=0.18):
-    """Reinhard tonemapping."""
-    lum = 0.2126 * hdr[:, 0:1] + 0.7152 * hdr[:, 1:2] + 0.0722 * hdr[:, 2:3]
-    lum_avg = torch.mean(lum, dim=[2, 3], keepdim=True)
-    lum_scaled = (key / (lum_avg + 1e-6)) * lum
-    tm = lum_scaled / (1.0 + lum_scaled)
-    return tm.expand_as(hdr)

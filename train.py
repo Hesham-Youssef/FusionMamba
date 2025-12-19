@@ -13,7 +13,7 @@ import torch.backends.cudnn as cudnn
 from torchinfo import summary
 from torch.utils.data import DataLoader
 
-from utils.tools import compute_hdr_loss
+from utils.tools import EnhancedHDRLoss
 from model.u2net import U2Net as Net
 from utils.hdr_load_train_data import HDRDatasetMaxPerf
 import cv2
@@ -208,95 +208,126 @@ def train(args, training_data_loader, train_set):
         dtypes=[torch.float, torch.float, torch.float, torch.float]
     )
     
-    # Optimizer and LR scheduler
-    optimizer = torch.optim.AdamW([
-        {"params": [p for n,p in model.named_parameters() if "scale_net" not in n], "lr": args.lr},
-        {"params": model.scale_net.parameters(), "lr": args.lr * 0.1},
-        {"params": model.skip_scale_net.parameters(), "lr": args.lr * 0.1},
-    ])
-    num_epochs_to_run = args.epoch
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=len(training_data_loader) * num_epochs_to_run,
-        pct_start=0.3,
-        anneal_strategy='cos'
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=1e-4,  # Reduced from 1e-2
+        betas=(0.9, 0.999),
+        eps=1e-8
     )
 
-    # Resume from checkpoint
-    start_epoch = 1
-    if args.resume_path and os.path.isfile(args.resume_path):
-        print(f"\nLoading checkpoint: {args.resume_path}")
-        checkpoint = torch.load(args.resume_path, map_location=args.device)
-        model.load_state_dict(checkpoint['model_state'])
-        optimizer.load_state_dict(checkpoint['optimizer_state'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"Resumed training from epoch {start_epoch}")
+    # Warmup + Cosine schedule
+    total_steps = len(training_data_loader) * args.epoch
+    warmup_steps = min(1000, total_steps // 10)
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    print(f"\nTraining from epoch {start_epoch} to {args.epoch}")
+
+    # Enhanced loss
+    criterion = EnhancedHDRLoss(
+        lambda_l1=1.0,
+        lambda_grad=0.5,
+        lambda_tm=0.3,
+        lambda_perc=0.1
+    ).to(args.device)
+
+    use_amp = getattr(args, 'amp', False)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    print(f"\nTraining for {args.epoch} epochs")
     print("=" * 80)
-    t_start = time.time()
+    
+    global_step = 0
+    best_loss = float('inf')
+    
+    for epoch in range(1, args.epoch + 1):
+        model.train()
+        
+        epoch_loss = 0.0
+        epoch_metrics = {
+            'l1': 0.0, 'grad': 0.0, 'tm': 0.0, 
+            'perc': 0.0, 'neg_penalty': 0.0, 'range': 0.0
+        }
+        num_batches = 0
 
-    try:
-        for epoch in range(start_epoch, args.epoch + 1):
-            model.train()
+        for iteration, batch in enumerate(training_data_loader, 1):
+            gt, ldr1, ldr2, sum1, sum2 = [x.to(args.device) for x in batch]
 
-            for iteration, batch in enumerate(training_data_loader, 1):
-                gt, ldr1, ldr2, sum1, sum2 = [x.to(args.device) for x in batch]
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                # Forward pass
+                sr_log = model(ldr1, ldr2, sum1, sum2)
+                target_log = torch.log1p(gt.clamp(min=0))
+                
+                # Compute enhanced loss
+                loss, loss_dict = criterion(sr_log, target_log)
+                
+                # Safety check
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\nWARNING: Invalid loss at epoch {epoch} iter {iteration}")
+                    print(f"  Loss components: {loss_dict}")
+                    continue
 
+            # Backward pass
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            
+            # Gradient clipping with adaptive threshold
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            
+            # Safety checks with more lenient thresholds
+            if not torch.isfinite(torch.tensor(grad_norm)):
+                print(f"\nWARNING: Non-finite grad_norm at epoch {epoch} iter {iteration}")
                 optimizer.zero_grad()
-                sr_log, sr_linear, adaptive_scale, skip_scale = model(ldr1, ldr2, sum1, sum2)
-
-                target_log = torch.log1p(gt)
-                
-                loss = compute_hdr_loss(
-                    sr_log, target_log, sr_linear, gt,
-                    adaptive_scale, skip_scale,
-                    epoch=(iteration + epoch * len(training_data_loader))//100
-                )
-
-                
-                # Backward and optimize
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.update()
                 lr_scheduler.step()
+                continue
 
-                # Progress printing
-                if iteration % args.print_freq == 0:
-                    print(
-                        f'Epoch {epoch}/{args.epoch} | '
-                        f'Iter {iteration}/{len(training_data_loader)} | '
-                        f'total_loss: {loss.item():.4f} | '
-                        f'LR: {optimizer.param_groups[0]["lr"]:.2e}'
-                    )
-                    print(f'  sr_linear: min={sr_linear.min():.4f}, max={sr_linear.max():.4f}, mean={sr_linear.mean():.4f}')
-                    print(f'  gt: min={gt.min():.4f}, max={gt.max():.4f}, mean={gt.mean():.4f}')
-                                
-                    print(f'{"-"*80}\n')
+            if grad_norm > 5000:
+                print(f"\nWARNING: Extreme grad_norm {grad_norm:.2f}, skipping")
+                optimizer.zero_grad()
+                scaler.update()
+                lr_scheduler.step()
+                continue
+            
+            scaler.step(optimizer)
+            scaler.update()
+            lr_scheduler.step()
+            
+            global_step += 1
+            epoch_loss += loss.item()
+            num_batches += 1
+            
+            # Accumulate metrics
+            for key, val in loss_dict.items():
+                epoch_metrics[key] += val
 
-                # Checkpoint every 200 iterations
-                if iteration % 200 == 0:
-                    save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
-                    print(f"\nCheckpoint saved at iteration {iteration + epoch}!")
+            # Progress printing
+            if iteration % args.print_freq == 0:
+                avg_loss = epoch_loss / num_batches
+                print(f'\nEpoch {epoch}/{args.epoch} | Iter {iteration}/{len(training_data_loader)}')
+                print(f'  Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]["lr"]:.2e} | Grad: {grad_norm:.2f}')
+                print(f'  Components: L1={epoch_metrics["l1"]/num_batches:.4f} '
+                      f'Grad={epoch_metrics["grad"]/num_batches:.4f} '
+                      f'TM={epoch_metrics["tm"]/num_batches:.4f} '
+                      f'NegPen={epoch_metrics["neg_penalty"]/num_batches:.4f}')
 
 
-            print(f'\n{"="*80}')
-            print(f'Time elapsed: {time.time() - t_start:.2f}s')
-            print(f'{"="*80}\n')
-            t_start = time.time()
+            # Checkpoint every 200 iterations
+            if iteration % 200 == 0:
+                save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
+                print(f"\nCheckpoint saved at iteration {iteration + epoch}!")
+    save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
+    print("\nTraining completed!")
 
-            save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
 
-        # Final checkpoint
-        # save_checkpoint(args, model, optimizer, lr_scheduler, args.epoch)
-        print("\nTraining completed!")
-
-    finally:
-        # Cleanup
-        print("\nCleaning up datasets...")
-        train_set.cleanup()
-        print("Cleanup completed.")
 
 
 if __name__ == "__main__":
