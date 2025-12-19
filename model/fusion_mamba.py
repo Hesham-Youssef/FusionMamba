@@ -34,40 +34,39 @@ class CrossMambaBlock(nn.Module):
                            if_devide_out=True, use_norm=True, input_h=H, input_w=W)
         self.post_norm = nn.LayerNorm(dim)
         
-        # FIX: Use LayerNorm + Linear instead of Sequential to avoid alignment issues
         self.cross_weight_linear1 = nn.Linear(dim * 2, dim)
         self.cross_weight_norm = nn.LayerNorm(dim)
         self.cross_weight_activation = nn.Sigmoid()
 
     def forward(self, input0, input1):
-        # input0: (B, N, C) | input1: (B, N, C)
+        # CRITICAL FIX: Clone inputs to ensure proper memory alignment
+        # This resolves CUDA misaligned address errors
+        input0 = input0.clone().contiguous()
+        input1 = input1.clone().contiguous()
+        
         skip = input0
         
-        input0_norm = self.norm0(input0)
-        input1_norm = self.norm1(input1)
-        
-        # FIX: Ensure contiguous memory before concatenation
-        input0_norm = input0_norm.contiguous()
-        input1_norm = input1_norm.contiguous()
+        input0_norm = self.norm0(input0).contiguous()
+        input1_norm = self.norm1(input1).contiguous()
         
         # Compute cross-attention weight
         combined = torch.cat([input0_norm, input1_norm], dim=-1)
+        combined = combined.clone().contiguous()  # Clone after cat to ensure alignment
         
-        # FIX: Ensure combined is contiguous before linear layer
-        combined = combined.contiguous()
-        
-        # Apply cross-attention weight calculation with explicit contiguous calls
         weight = self.cross_weight_linear1(combined)
-        weight = self.cross_weight_norm(weight)
-        weight = weight.contiguous()  # FIX: Ensure contiguous before activation
+        weight = self.cross_weight_norm(weight).contiguous()
         weight = self.cross_weight_activation(weight)
         
-        # Apply weighted fusion
-        output = self.block(input0_norm, extra_emb=input1_norm)
-        output = self.post_norm(output)
+        # CRITICAL: Clone and ensure contiguous before passing to Mamba
+        input0_for_mamba = input0_norm.clone().contiguous()
+        input1_for_mamba = input1_norm.clone().contiguous()
+        
+        # Apply Mamba block
+        output = self.block(input0_for_mamba, extra_emb=input1_for_mamba)
+        output = self.post_norm(output).contiguous()
         output = output * weight + input0_norm * (1 - weight)
         
-        return output + skip
+        return (output + skip).contiguous()
 
 class FusionMamba(nn.Module):
     """Enhanced FusionMamba with multi-stage fusion - FIXED for memory alignment"""
