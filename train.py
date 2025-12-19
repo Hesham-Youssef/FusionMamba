@@ -194,11 +194,11 @@ def train(args, training_data_loader, train_set):
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
-
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
     # Print model summary
     print("\nModel Architecture:")
     summary(
-        model,
+        raw_model,
         input_size=[
             (args.batch_size, 3, args.H, args.W),  # ldr1
             (args.batch_size, 3, args.H, args.W),  # ldr2
@@ -427,4 +427,6 @@ if __name__ == "__main__":
     print("="*80)
 
     training_data_loader, train_set = prepare_training_data(args)
+
     train(args, training_data_loader, train_set)
+
