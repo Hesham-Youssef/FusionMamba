@@ -8,21 +8,12 @@ from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 
 
-def check_tensor_valid(tensor, name="tensor"):
-    """Check if tensor contains NaN or Inf values"""
-    if torch.isnan(tensor).any():
-        raise ValueError(f"{name} contains NaN values")
-    if torch.isinf(tensor).any():
-        raise ValueError(f"{name} contains Inf values")
-    return tensor
-
-
 class SingleMambaBlock(nn.Module):
     def __init__(self, dim, H, W):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v6', 
-                           if_devide_out=True, use_norm=True, input_h=H, input_w=W)
+        self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v2', 
+                           if_devide_out=True, use_norm=True)
         self.post_norm = nn.LayerNorm(dim)
         
     def forward(self, input):
@@ -35,80 +26,60 @@ class SingleMambaBlock(nn.Module):
 
 
 class CrossMambaBlock(nn.Module):
+    """Safer CrossMambaBlock that concatenates instead of using extra_emb"""
     def __init__(self, dim, H, W):
         super().__init__()
         self.norm0 = nn.LayerNorm(dim)
         self.norm1 = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v7', 
-                           if_devide_out=True, use_norm=True, input_h=H, input_w=W)
-        self.post_norm = nn.LayerNorm(dim)
         
-        self.cross_weight_linear1 = nn.Linear(dim * 2, dim)
-        self.cross_weight_norm = nn.LayerNorm(dim)
-        self.cross_weight_activation = nn.Sigmoid()
+        # Process concatenated features instead of using extra_emb
+        self.block = Mamba(dim * 2, expand=1, d_state=16, bimamba_type='v2', 
+                           if_devide_out=True, use_norm=True)
         
-        # Add gradient clipping to prevent instability
-        self.gradient_clip_val = 1.0
+        self.post_norm = nn.LayerNorm(dim * 2)
+        
+        # Project back to original dimension
+        self.proj_back = nn.Linear(dim * 2, dim)
+        
+        # Cross-attention weight
+        self.cross_weight = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
+            nn.Sigmoid()
+        )
 
     def forward(self, input0, input1):
-        # Validate inputs
+        B, N, C = input0.shape
+        
+        # Ensure contiguous and validate
+        input0 = input0.contiguous()
+        input1 = input1.contiguous()
+        
+        # Check for NaN/Inf
         if torch.isnan(input0).any() or torch.isinf(input0).any():
-            print("Warning: input0 contains NaN or Inf, replacing with zeros")
             input0 = torch.nan_to_num(input0, nan=0.0, posinf=1.0, neginf=-1.0)
-        
         if torch.isnan(input1).any() or torch.isinf(input1).any():
-            print("Warning: input1 contains NaN or Inf, replacing with zeros")
             input1 = torch.nan_to_num(input1, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Ensure contiguous memory (minimal cloning)
-        if not input0.is_contiguous():
-            input0 = input0.contiguous()
-        if not input1.is_contiguous():
-            input1 = input1.contiguous()
         
         skip = input0
         
-        # Normalize inputs
+        # Normalize
         input0_norm = self.norm0(input0)
         input1_norm = self.norm1(input1)
         
-        # Ensure normalized tensors are valid
-        input0_norm = torch.nan_to_num(input0_norm, nan=0.0, posinf=1.0, neginf=-1.0)
-        input1_norm = torch.nan_to_num(input1_norm, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Compute cross-attention weight
+        # Concatenate instead of using extra_emb (safer approach)
         combined = torch.cat([input0_norm, input1_norm], dim=-1)
         
-        weight = self.cross_weight_linear1(combined)
-        weight = self.cross_weight_norm(weight)
-        weight = torch.nan_to_num(weight, nan=0.5, posinf=1.0, neginf=0.0)
-        weight = self.cross_weight_activation(weight)
-        
-        # Clamp weight to prevent extreme values
+        # Compute attention weight
+        weight = self.cross_weight(combined)
         weight = torch.clamp(weight, min=0.01, max=0.99)
         
-        # CRITICAL FIX: Ensure proper memory layout before Mamba
-        # Only clone if necessary to save memory
-        if not input0_norm.is_contiguous():
-            input0_norm = input0_norm.contiguous()
-        if not input1_norm.is_contiguous():
-            input1_norm = input1_norm.contiguous()
-        
-        # Apply Mamba block with error handling
-        try:
-            output = self.block(input0_norm, extra_emb=input1_norm)
-        except RuntimeError as e:
-            print(f"Mamba block error: {e}")
-            print(f"input0_norm shape: {input0_norm.shape}, dtype: {input0_norm.dtype}")
-            print(f"input1_norm shape: {input1_norm.shape}, dtype: {input1_norm.dtype}")
-            print(f"input0_norm device: {input0_norm.device}, input1_norm device: {input1_norm.device}")
-            print(f"input0_norm is_contiguous: {input0_norm.is_contiguous()}")
-            print(f"input1_norm is_contiguous: {input1_norm.is_contiguous()}")
-            # Fallback: use only input0_norm without extra_emb
-            print("Falling back to single-input Mamba")
-            output = self.block(input0_norm)
-        
+        # Process through Mamba (no extra_emb parameter)
+        output = self.block(combined)
         output = self.post_norm(output)
+        
+        # Project back to original dimension
+        output = self.proj_back(output)
         output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Apply weighted fusion
@@ -118,7 +89,7 @@ class CrossMambaBlock(nn.Module):
 
 
 class FusionMamba(nn.Module):
-    """Enhanced FusionMamba with multi-stage fusion - FIXED for CUBLAS errors"""
+    """Safer FusionMamba without extra_emb parameter"""
     def __init__(self, dim, H, W, depth=2, final=False):
         super().__init__()
         self.final = final
@@ -141,7 +112,7 @@ class FusionMamba(nn.Module):
         # Self-attention for refinement
         self.self_attn = SingleMambaBlock(dim, H, W)
         
-        # Output projection with gating
+        # Output projection
         self.out_proj = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim * 2),
@@ -149,32 +120,18 @@ class FusionMamba(nn.Module):
             nn.Linear(dim * 2, dim)
         )
         
-        # Learnable fusion weights (initialized to prevent instability)
+        # Learnable fusion weights
         self.alpha = nn.Parameter(torch.tensor(0.5))
         self.beta = nn.Parameter(torch.tensor(0.5))
         
     def forward(self, img1, img2, img1_sum, img2_sum):
         b, c, h, w = img1.shape
         
-        # Validate inputs
-        for name, tensor in [("img1", img1), ("img2", img2), 
-                             ("img1_sum", img1_sum), ("img2_sum", img2_sum)]:
-            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                print(f"Warning: {name} contains NaN or Inf, cleaning...")
-                if name == "img1":
-                    img1 = torch.nan_to_num(img1, nan=0.0, posinf=1.0, neginf=-1.0)
-                elif name == "img2":
-                    img2 = torch.nan_to_num(img2, nan=0.0, posinf=1.0, neginf=-1.0)
-                elif name == "img1_sum":
-                    img1_sum = torch.nan_to_num(img1_sum, nan=0.0, posinf=1.0, neginf=-1.0)
-                elif name == "img2_sum":
-                    img2_sum = torch.nan_to_num(img2_sum, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # Ensure inputs are contiguous
-        img1 = img1.contiguous()
-        img2 = img2.contiguous()
-        img1_sum = img1_sum.contiguous()
-        img2_sum = img2_sum.contiguous()
+        # Clean any NaN/Inf in inputs
+        img1 = torch.nan_to_num(img1, nan=0.0, posinf=1.0, neginf=-1.0)
+        img2 = torch.nan_to_num(img2, nan=0.0, posinf=1.0, neginf=-1.0)
+        img1_sum = torch.nan_to_num(img1_sum, nan=0.0, posinf=1.0, neginf=-1.0)
+        img2_sum = torch.nan_to_num(img2_sum, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # Reshape to sequence format
         img1 = rearrange(img1, 'b c h w -> b (h w) c', h=h, w=w)
@@ -183,20 +140,15 @@ class FusionMamba(nn.Module):
         img2_sum = rearrange(img2_sum, 'b c h w -> b (h w) c', h=h, w=w)
         
         # Progressive fusion through layers
-        for i, (spa_layer, spe_layer) in enumerate(zip(self.spa_mamba_layers, self.spe_mamba_layers)):
-            try:
-                img1 = spa_layer(img1, img1_sum)
-                img2 = spe_layer(img2, img2_sum)
-            except RuntimeError as e:
-                print(f"Error in layer {i}: {e}")
-                # Skip this layer if it fails
-                continue
+        for spa_layer, spe_layer in zip(self.spa_mamba_layers, self.spe_mamba_layers):
+            img1 = spa_layer(img1, img1_sum)
+            img2 = spe_layer(img2, img2_sum)
         
         # Cross-modal fusion
         spa_fusion = self.spa_cross_mamba(img1, img2)
         spe_fusion = self.spe_cross_mamba(img2, img1)
         
-        # Weighted combination with learnable parameters
+        # Weighted combination
         alpha = torch.clamp(self.alpha, min=0.1, max=2.0)
         beta = torch.clamp(self.beta, min=0.1, max=2.0)
         
@@ -218,7 +170,6 @@ class FusionMamba(nn.Module):
         if self.final:
             return output
         else:
-            # Residual connections for stability
             result1 = (img1 + output) * 0.5
             result2 = (img2 + output) * 0.5
             return result1, result2
