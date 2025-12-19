@@ -121,26 +121,25 @@ class Stage(nn.Module):
 
     def forward(self, img1, img2, img1_sum, img2_sum, img1_pre=None, img2_pre=None):
         img1, img2 = self.fm(img1, img2, img1_sum, img2_sum)
-        
+
         if img1_pre is None:
             # Downsampling path
             img1_skip = img1
             img2_skip = img2
-            img1 = self.sample(img1)
-            img2 = self.sample(img2)
+            img1 = self.sample(img1).contiguous()
+            img2 = self.sample(img2).contiguous()
             
-            img1_sum = self.sum_sample(img1_sum)
-            img2_sum = self.sum_sample(img2_sum)
+            img1_sum = self.sum_sample(img1_sum).contiguous()
+            img2_sum = self.sum_sample(img2_sum).contiguous()
             return img1, img2, img1_sum, img2_sum, img1_skip, img2_skip
         else:
             # Upsampling path
-            img1 = self.sample(img1, img1_pre)
-            img2 = self.sample(img2, img2_pre)
+            img1 = self.sample(img1, img1_pre).contiguous()
+            img2 = self.sample(img2, img2_pre).contiguous()
             
-            img1_sum = self.sum_sample(img1_sum, img1_pre)
-            img2_sum = self.sum_sample(img2_sum, img2_pre)
+            img1_sum = self.sum_sample(img1_sum, img1_pre).contiguous()
+            img2_sum = self.sum_sample(img2_sum, img2_pre).contiguous()
             return img1, img2, img1_sum, img2_sum
-
 
 class HDRHead(nn.Module):
     """Output head with proper HDR range handling"""
