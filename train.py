@@ -190,10 +190,6 @@ def train(args, training_data_loader, train_set):
         args.W
     ).to(args.device)
 
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     # Print model summary
     print("\nModel Architecture:")
