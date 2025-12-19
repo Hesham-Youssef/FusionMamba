@@ -51,18 +51,21 @@ class ExposureAwareAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
+        # FIX: Ensure input is contiguous
+        x = x.contiguous()
+        
         avg_out = self.avg_pool(x)
         max_out = self.max_pool(x)
         
         # Combine average and max pooling for exposure awareness
-        combined = torch.cat([avg_out, max_out], dim=1)
+        combined = torch.cat([avg_out, max_out], dim=1).contiguous()
         attention = self.sigmoid(self.fc(combined))
         
         return x * attention
 
 
 class Up(nn.Module):
-    """Improved upsampling with residual connections"""
+    """Improved upsampling with residual connections - FIXED for memory alignment"""
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
         
@@ -83,12 +86,18 @@ class Up(nn.Module):
         self.attention = ExposureAwareAttention(out_channels)
         
     def forward(self, x1, x2):
-        x1 = self.up(x1)
-        # Concatenate instead of add for richer information
-        x = torch.cat([x1, x2], dim=1)
-        x = self.conv(x)
-        x = self.attention(x)
-        return x + x1  # Residual connection
+        # FIX: Ensure inputs are contiguous
+        x1 = x1.contiguous()
+        x2 = x2.contiguous()
+        
+        x1 = self.up(x1).contiguous()
+        
+        # FIX: Concatenate and ensure result is contiguous before conv
+        x = torch.cat([x1, x2], dim=1).contiguous()
+        x = self.conv(x).contiguous()
+        x = self.attention(x).contiguous()
+        
+        return (x + x1).contiguous()  # Residual connection
 
 
 class Down(nn.Module):
@@ -105,7 +114,10 @@ class Down(nn.Module):
         )
 
     def forward(self, x):
-        return self.down(x)
+        # FIX: Ensure input is contiguous
+        x = x.contiguous()
+        return self.down(x).contiguous()
+
 
 class Stage(nn.Module):
     def __init__(self, in_channels, out_channels, H, W, scale=2, sample_mode='down'):
@@ -120,12 +132,22 @@ class Stage(nn.Module):
             self.sum_sample = Up(in_channels, out_channels, scale)
 
     def forward(self, img1, img2, img1_sum, img2_sum, img1_pre=None, img2_pre=None):
+        # FIX: Ensure all inputs are contiguous
+        img1 = img1.contiguous()
+        img2 = img2.contiguous()
+        img1_sum = img1_sum.contiguous()
+        img2_sum = img2_sum.contiguous()
+        
         img1, img2 = self.fm(img1, img2, img1_sum, img2_sum)
+        
+        # FIX: Ensure outputs from FusionMamba are contiguous
+        img1 = img1.contiguous()
+        img2 = img2.contiguous()
 
         if img1_pre is None:
             # Downsampling path
-            img1_skip = img1
-            img2_skip = img2
+            img1_skip = img1.contiguous()
+            img2_skip = img2.contiguous()
             img1 = self.sample(img1).contiguous()
             img2 = self.sample(img2).contiguous()
             
@@ -134,12 +156,17 @@ class Stage(nn.Module):
             return img1, img2, img1_sum, img2_sum, img1_skip, img2_skip
         else:
             # Upsampling path
+            # FIX: Ensure skip connections are contiguous
+            img1_pre = img1_pre.contiguous()
+            img2_pre = img2_pre.contiguous()
+            
             img1 = self.sample(img1, img1_pre).contiguous()
             img2 = self.sample(img2, img2_pre).contiguous()
             
             img1_sum = self.sum_sample(img1_sum, img1_pre).contiguous()
             img2_sum = self.sum_sample(img2_sum, img2_pre).contiguous()
             return img1, img2, img1_sum, img2_sum
+
 
 class HDRHead(nn.Module):
     """Output head with proper HDR range handling"""
@@ -157,11 +184,13 @@ class HDRHead(nn.Module):
         )
         
     def forward(self, x):
+        # FIX: Ensure input is contiguous
+        x = x.contiguous()
+        
         # Output in log space, ensuring positive values
         out = self.conv(x)
         # Use softplus to ensure positive output (always >= 0)
         return F.softplus(out) + 1e-8
-
 
 
 class SpeAttention(nn.Module):
@@ -181,11 +210,14 @@ class SpeAttention(nn.Module):
         )
 
     def forward(self, input):
+        # FIX: Ensure input is contiguous
+        input = input.contiguous()
+        
         avg_out = self.avg_pool(input).squeeze(-1)
         max_out = self.max_pool(input).squeeze(-1)
         
         # Combine statistics
-        combined = torch.cat([avg_out, max_out], dim=-1)
+        combined = torch.cat([avg_out, max_out], dim=-1).contiguous()
         output = self.block(combined).unsqueeze(-1)
         
         # Scale from [-1, 1] to [0.5, 1.5] for stable multiplication
@@ -197,7 +229,6 @@ class U2Net(nn.Module):
     def __init__(self, dim, img1_dim, img2_dim, H=64, W=64, scale=4):
         super().__init__()
 
-        # self.upsample = PixelShuffle(img2_dim, scale)
         self.raise_img1_dim = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
             DynamicRangeNorm(dim),
@@ -256,14 +287,20 @@ class U2Net(nn.Module):
         )
 
     def forward(self, img1, img2, sum1, sum2):
-        org_img1 = img1
-        org_img2 = img2
-
-        img1 = self.raise_img1_dim(img1)
-        img2 = self.raise_img2_dim(img2)
+        # FIX: Ensure all inputs are contiguous at the start
+        img1 = img1.contiguous()
+        img2 = img2.contiguous()
+        sum1 = sum1.contiguous()
+        sum2 = sum2.contiguous()
         
-        sum1 = self.raise_img1_sum_dim(sum1)
-        sum2 = self.raise_img2_sum_dim(sum2)
+        org_img1 = img1.contiguous()
+        org_img2 = img2.contiguous()
+
+        img1 = self.raise_img1_dim(img1).contiguous()
+        img2 = self.raise_img2_dim(img2).contiguous()
+        
+        sum1 = self.raise_img1_sum_dim(sum1).contiguous()
+        sum2 = self.raise_img2_sum_dim(sum2).contiguous()
 
         # main body
         img1, img2, sum1, sum2, img1_skip0, img2_skip0 = self.stage0(img1, img2, sum1, sum2)
@@ -271,18 +308,25 @@ class U2Net(nn.Module):
         
         img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, img1_skip1, img2_skip1)
         img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
-        output = self.stage4(img1, img2, sum1, sum2)
+        
+        # FIX: Ensure inputs to final stage are contiguous
+        img1 = img1.contiguous()
+        img2 = img2.contiguous()
+        sum1 = sum1.contiguous()
+        sum2 = sum2.contiguous()
+        
+        output = self.stage4(img1, img2, sum1, sum2).contiguous()
 
         for refine_layer in self.feature_refine:
-            output = output + refine_layer(output)
+            output = (output + refine_layer(output.contiguous())).contiguous()
         
         # Final refinement
-        output = output + self.final_refine(output)
+        output = (output + self.final_refine(output.contiguous())).contiguous()
 
         img1_attn = self.img1_spe_attn(org_img1)
         img2_attn = self.img2_spe_attn(org_img2)
-        combined_attn = (img1_attn + img2_attn) * 0.5 + 0.5  # Ensure positive
+        combined_attn = ((img1_attn + img2_attn) * 0.5 + 0.5).contiguous()
 
-        output = self.to_hrimg2(output) * combined_attn
+        output = (self.to_hrimg2(output) * combined_attn).contiguous()
 
         return output
