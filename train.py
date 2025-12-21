@@ -1,428 +1,547 @@
 import os
-import time
-import csv
-from pathlib import Path
-import argparse
-
 import torch
-import numpy as np
-import torch.nn as nn
-import torch.optim as optim
-import torch.backends.cudnn as cudnn
-
-from torchinfo import summary
+from torch import optim
 from torch.utils.data import DataLoader
-
-from utils.tools import EnhancedHDRLoss
-from model.u2net import U2Net as Net
-from utils.hdr_load_train_data import HDRDatasetMaxPerf
-import cv2
-
-SEED = 1
-torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-cudnn.benchmark = True
-
-
-def save_batch_debug(gt, ldr1, ldr2, sr, epoch, iteration):
-    """Save first batch for debugging purposes."""
-    out_dir = f"debug/epoch_{epoch}"
-    os.makedirs(out_dir, exist_ok=True)
-
-    def to_hdr(x):
-        """Convert tensor to HDR numpy array for saving."""
-        img = x[0].detach().cpu().permute(1, 2, 0).numpy().astype(np.float32)
-        if img.shape[2] == 3:
-            img = img[..., ::-1]  # RGB -> BGR for OpenCV
-        return img
-
-    # Save HDR files
-    cv2.imwrite(os.path.join(out_dir, f"gt_{iteration}.hdr"), to_hdr(gt))
-    cv2.imwrite(os.path.join(out_dir, f"ldr1_{iteration}.hdr"), to_hdr(ldr1))
-    cv2.imwrite(os.path.join(out_dir, f"ldr2_{iteration}.hdr"), to_hdr(ldr2))
-    cv2.imwrite(os.path.join(out_dir, f"sr_{iteration}.hdr"), to_hdr(sr))
+from utils.tools import *
+from model.u2net import U2Net
+import numpy as np
+from utils.hdr_load_train_data import *
+from config import Configs
+import random
+import time
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import json
 
 
-def save_checkpoint(args, model, optimizer, scheduler, epoch):
-    """Save model checkpoint."""
-    os.makedirs(args.weight_dir, exist_ok=True)
-    save_path = os.path.join(args.weight_dir, f"epoch_{epoch}.pth")
-
-    torch.save({
-        'epoch': epoch,
-        'model_state': model.state_dict(),
-        'optimizer_state': optimizer.state_dict(),
-        'scheduler_state': scheduler.state_dict()
-    }, save_path)
-
-    print(f"Checkpoint saved: {save_path}")
+def setup_seed(seed=0):
+    """Set random seeds for reproducibility"""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
-# -----------------------------
-# CSV split helper
-# -----------------------------
-def read_split_csv(csv_path):
-    """
-    Read a CSV/TSV with columns 'scene' and 'split' and return a dict mapping split -> set(scenes).
-    Accepts comma or tab delimiters.
-    """
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Split CSV not found: {csv_path}")
-
-    # try comma first, then tab
-    for delimiter in [',', '\t']:
-        with open(csv_path, newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
-            if reader.fieldnames and 'scene' in reader.fieldnames and 'split' in reader.fieldnames:
-                splits = {}
-                f.seek(0)
-                reader = csv.DictReader(f, delimiter=delimiter, skipinitialspace=True)
-                for row in reader:
-                    scene = row.get('scene')
-                    sp = row.get('split')
-                    if scene is None or sp is None:
-                        continue
-                    scene = scene.strip()
-                    sp = sp.strip()
-                    splits.setdefault(sp, set()).add(scene)
-                return splits
-    raise RuntimeError("CSV must contain 'scene' and 'split' columns (tab or comma separated).")
-
-
-# -----------------------------
-# Prepare data loaders
-# -----------------------------
-def prepare_training_data(args):
-    """Prepare training and validation data loaders with optimized features.
-    Supports two modes:
-    1) CSV split mode: pass --split_csv and --data_dir, script reads CSV and filters scenes.
-    2) Classic mode: pass --train_data_path and --val_data_path (backwards compatible).
-    """
-    # Use tile dimensions from args (H and W are the tile dimensions)
-    tile_h = args.H
-    tile_w = args.W
-    stride_h = args.stride_H
-    stride_w = args.stride_W
-
-    print(f"\n{'='*80}")
-    print("Dataset Configuration:")
-    print(f"  Tile size: {tile_h}x{tile_w}")
-    print(f"  Stride: {stride_h}x{stride_w}")
-    print(f"\nOptimization Features:")
-    print(f"  Parallel load threads: {args.num_load_threads}")
-    print(f"  Disk cache: {args.use_disk_cache}")
-    if args.use_disk_cache:
-        print(f"  Disk cache dir: {args.disk_cache_dir}")
-    print(f"  Max cached pairs: {args.max_cached_pairs}")
-    print(f"  Smart sampler: {args.use_smart_sampler}")
-    print(f"{'='*80}\n")
-
-    if not args.data_dir:
-        # fallback to train_data_path if provided
-        if args.train_data_path:
-            data_dir = args.train_data_path
-        elif args.val_data_path:
-            data_dir = args.val_data_path
-        else:
-            raise ValueError("When using --split_csv you must provide --data_dir or --train_data_path/--val_data_path")
-    else:
-        data_dir = args.data_dir
-
-    print(f"Reading split CSV: {args.split_csv}")
-    splits = read_split_csv(args.split_csv)
-    train_scenes = splits.get('train', set())
-    val_scenes = splits.get('val', set())
-
-    available = set(p.name for p in Path(data_dir).iterdir() if p.is_dir())
-    missing_train = train_scenes - available
-    missing_val = val_scenes - available
-    if missing_train:
-        print(f"Warning: {len(missing_train)} train scenes from CSV not found in {data_dir}. They will be ignored.")
-    if missing_val:
-        print(f"Warning: {len(missing_val)} val scenes from CSV not found in {data_dir}. They will be ignored.")
-
-    train_scenes = sorted(list(train_scenes & available))
-    val_scenes = sorted(list(val_scenes & available))
-
-    print(f"Using {len(train_scenes)} scenes for training, {len(val_scenes)} for validation (from CSV).")
-
-    train_set = HDRDatasetMaxPerf(
-        data_dir=data_dir,
-        tile_h=tile_h, tile_w=tile_w,
-        stride_h=stride_h, stride_w=stride_w,
-        split='train',
-        split_scenes=train_scenes,
-        max_cached_pairs=args.max_cached_pairs,
-        num_load_threads=args.num_load_threads,
-        use_disk_cache=args.use_disk_cache,
-        disk_cache_dir=args.disk_cache_dir if args.use_disk_cache else None,
-        summary_only=args.summary_only,
-        disk_max_size_bytes=args.disk_max_size_bytes,
-    )
-
-    print(f"Training tiles: {len(train_set)}")
-
-    print("Using smart sampler for better cache locality")
-    train_sampler = train_set.get_smart_sampler(args.batch_size, shuffle=True)
-    training_data_loader = DataLoader(
-        dataset=train_set,
-        batch_sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=False,
-        persistent_workers=False if args.num_workers > 0 else False,
-        prefetch_factor=1 if args.num_workers > 0 else None
-    )
-    
-    return training_data_loader, train_set
-
-
-def train(args, training_data_loader, train_set):
-    """Main training loop with fixed HDR loss."""
-
-    # Initialize model
-    model = Net(
-        args.channels,
-        args.first_channels,
-        args.second_channels,
-        args.H,
-        args.W
-    ).to(args.device)
-
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
-    # Print model summary
-    print("\nModel Architecture:")
-    summary(
-        raw_model,
-        input_size=[
-            (args.batch_size, 3, args.H, args.W),  # ldr1
-            (args.batch_size, 3, args.H, args.W),  # ldr2
-            (args.batch_size, 3, args.H, args.W),  # sum1
-            (args.batch_size, 3, args.H, args.W)   # sum2
-        ],
-        dtypes=[torch.float, torch.float, torch.float, torch.float]
-    )
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,  # Reduced from 1e-2
-        betas=(0.9, 0.999),
-        eps=1e-8
-    )
-
-    # Warmup + Cosine schedule
-    total_steps = len(training_data_loader) * args.epoch
-    warmup_steps = min(1000, total_steps // 10)
-    
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
-        return 0.5 * (1 + np.cos(np.pi * progress))
-    
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-    # Enhanced loss
-    criterion = EnhancedHDRLoss(
-        lambda_l1=1.0,
-        lambda_grad=0.5,
-        lambda_tm=0.3,
-        lambda_perc=0.1
-    ).to(args.device)
-
-    use_amp = getattr(args, 'amp', False)
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-
-    print(f"\nTraining for {args.epoch} epochs")
-    print("=" * 80)
-    
-    global_step = 0
-    best_loss = float('inf')
-    
-    for epoch in range(1, args.epoch + 1):
-        model.train()
+class Logger:
+    """Simple logger for training"""
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, 'training.log')
         
-        epoch_loss = 0.0
-        epoch_metrics = {
-            'l1': 0.0, 'grad': 0.0, 'tm': 0.0, 
-            'perc': 0.0, 'neg_penalty': 0.0, 'range': 0.0
+    def log(self, message, print_console=True):
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        log_message = f"[{timestamp}] {message}"
+        
+        if print_console:
+            print(log_message)
+        
+        with open(self.log_file, 'a') as f:
+            f.write(log_message + '\n')
+
+
+
+
+def make_blend_window(h, w, device, blend_type='gaussian'):
+    """
+    Create blending window optimized to eliminate tiling artifacts
+    
+    Args:
+        blend_type: 'gaussian', 'cosine', 'linear', or 'hann'
+    """
+    if blend_type == 'gaussian':
+        # Gaussian - BEST for eliminating grid artifacts
+        y = torch.linspace(-1, 1, h, device=device)
+        x = torch.linspace(-1, 1, w, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        
+        # Gaussian from center with sigma tuned to minimize artifacts
+        dist = torch.sqrt(xx**2 + yy**2)
+        sigma = 0.5  # Larger = more gradual falloff
+        weight = torch.exp(-(dist**2) / (2 * sigma**2))
+        
+        # Normalize to [0, 1] range
+        weight = (weight - weight.min()) / (weight.max() - weight.min() + 1e-8)
+        return weight[None, None]
+        
+    elif blend_type == 'cosine':
+        # Cosine window - smoother than Hann
+        wy = (1 - torch.cos(torch.linspace(0, torch.pi, h, device=device))) / 2
+        wx = (1 - torch.cos(torch.linspace(0, torch.pi, w, device=device))) / 2
+    elif blend_type == 'linear':
+        # Linear ramps
+        wy = torch.linspace(0, 1, h, device=device)
+        wx = torch.linspace(0, 1, w, device=device)
+    else:  # hann
+        wy = torch.hann_window(h, periodic=False, device=device)
+        wx = torch.hann_window(w, periodic=False, device=device)
+    
+    w2d = wy[:, None] * wx[None, :]
+    return w2d[None, None]  # (1,1,H,W)
+
+
+def eval_one_epoch(epoch, save_outputs=True):
+    model.eval()
+    mean_loss = 0.0
+    count = 0
+
+    patch_h, patch_w = configs.patch_size
+    # FIX: MAXIMUM overlap to eliminate grid artifacts (87.5% overlap)
+    stride = patch_h // 2  # Was patch_h // 4
+    
+    # FIX: Larger padding for better edge context
+    PAD = patch_h // 3  # Was patch_h // 4
+
+    PATCH_CHUNK = 120  # tune: 2–8 for 6GB GPU
+
+    pbar = tqdm(test_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Eval]')
+
+    for _, data in enumerate(pbar):
+        sample_path, img1_ldr, img2_ldr, img1_hdr, img2_hdr, sum1, sum2, ref_HDR = data
+        sample_path = sample_path[0]
+
+        img1_ldr = img1_ldr.to(device)
+        img2_ldr = img2_ldr.to(device)
+        img1_hdr = img1_hdr.to(device)
+        img2_hdr = img2_hdr.to(device)
+        sum1 = sum1.to(device)
+        sum2 = sum2.to(device)
+        ref_HDR = ref_HDR.to(device)
+
+        _, _, H, W = img1_ldr.shape
+
+        # ============================================================
+        # TILED PATH WITH PROPER PADDING
+        # ============================================================
+        if H > patch_h or W > patch_w:
+
+            img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
+            img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
+
+            # FIX: Pad images with reflection for better edge handling
+            img1_padded = F.pad(img1, (PAD, PAD, PAD, PAD), mode='reflect')
+            img2_padded = F.pad(img2, (PAD, PAD, PAD, PAD), mode='reflect')
+            sum1_padded = F.pad(sum1, (PAD, PAD, PAD, PAD), mode='reflect')
+            sum2_padded = F.pad(sum2, (PAD, PAD, PAD, PAD), mode='reflect')
+
+            H_padded = H + 2 * PAD
+            W_padded = W + 2 * PAD
+
+            # ---- Generate patch coordinates with better coverage ----
+            h_starts = list(range(0, max(1, H_padded - patch_h + 1), stride))
+            w_starts = list(range(0, max(1, W_padded - patch_w + 1), stride))
+
+            # FIX: Ensure complete coverage by adding final patches if needed
+            if h_starts[-1] + patch_h < H_padded:
+                h_starts.append(H_padded - patch_h)
+            if w_starts[-1] + patch_w < W_padded:
+                w_starts.append(W_padded - patch_w)
+
+            patch_coords = [(hs, ws) for hs in h_starts for ws in w_starts]
+
+            # Initialize output buffers (padded size)
+            result = torch.zeros((1, ref_HDR.shape[1], H_padded, W_padded), 
+                                device=device, dtype=ref_HDR.dtype)
+            weight_map = torch.zeros((1, 1, H_padded, W_padded), device=device)
+
+            # FIX: Use Gaussian window for smoothest blending (eliminates grid artifacts)
+            blend = make_blend_window(patch_h, patch_w, device, blend_type='gaussian')
+
+            # ---- Chunked inference ----
+            with torch.no_grad():
+                for start in range(0, len(patch_coords), PATCH_CHUNK):
+                    batch = patch_coords[start:start + PATCH_CHUNK]
+
+                    b_img1, b_img2, b_sum1, b_sum2 = [], [], [], []
+
+                    for hs, ws in batch:
+                        he = hs + patch_h
+                        we = ws + patch_w
+
+                        b_img1.append(img1_padded[:, :, hs:he, ws:we])
+                        b_img2.append(img2_padded[:, :, hs:he, ws:we])
+                        b_sum1.append(sum1_padded[:, :, hs:he, ws:we])
+                        b_sum2.append(sum2_padded[:, :, hs:he, ws:we])
+
+                    b_img1 = torch.cat(b_img1, dim=0)
+                    b_img2 = torch.cat(b_img2, dim=0)
+                    b_sum1 = torch.cat(b_sum1, dim=0)
+                    b_sum2 = torch.cat(b_sum2, dim=0)
+
+                    out = model(b_img1, b_img2, b_sum1, b_sum2)
+                    
+                    # Apply blending window
+                    out = out * blend
+
+                    # Accumulate results
+                    for i, (hs, ws) in enumerate(batch):
+                        he = hs + patch_h
+                        we = ws + patch_w
+
+                        result[:, :, hs:he, ws:we] += out[i:i+1]
+                        weight_map[:, :, hs:he, ws:we] += blend
+
+            # FIX: Normalize with minimum threshold
+            result = result / torch.clamp(weight_map, min=1e-3)
+            
+            # FIX: Remove padding to get back to original size
+            result = result[:, :, PAD:PAD+H, PAD:PAD+W]
+            
+            # FIX: Optional post-smoothing to eliminate remaining artifacts
+            # Uncomment if you still see grid patterns
+            # result = self.smooth_boundaries(result, patch_h, stride)
+
+        # ============================================================
+        # NON-TILED PATH
+        # ============================================================
+        else:
+            img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
+            img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
+
+            with torch.no_grad():
+                result = model(img1, img2, sum1, sum2)
+
+        # ============================================================
+        # LOSS + OUTPUT
+        # ============================================================
+        loss = criterion(tonemap(result), tonemap(ref_HDR))
+
+        if save_outputs:
+            dump_sample(sample_path, result.cpu().numpy())
+
+        mean_loss += loss.item()
+        count += 1
+        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+
+    return mean_loss / max(count, 1)
+
+
+# Get configurations
+configs = Configs()
+
+# Create directories
+os.makedirs(configs.checkpoint_dir, exist_ok=True)
+os.makedirs(configs.sample_dir, exist_ok=True)
+log_dir = os.path.join(configs.checkpoint_dir, 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+# Initialize logger and tensorboard
+logger = Logger(log_dir)
+writer = SummaryWriter(log_dir=log_dir)
+
+logger.log("="*80)
+logger.log("Starting U2Net HDR Training")
+logger.log("="*80)
+
+# Setup reproducibility
+if hasattr(configs, 'seed'):
+    setup_seed(configs.seed)
+    logger.log(f"Random seed set to: {configs.seed}")
+
+# Load Data & build dataset
+logger.log("Loading training dataset...")
+train_dataset = U2NetDataset(configs=configs)
+train_dataloader = DataLoader(
+    train_dataset, 
+    batch_size=configs.batch_size, 
+    shuffle=True,
+    num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
+    pin_memory=True
+)
+logger.log(f"Training dataset loaded: {len(train_dataset)} patches")
+
+logger.log("Loading test dataset...")
+test_dataset = U2NetTestDataset(configs=configs)
+test_dataloader = DataLoader(
+    test_dataset, 
+    batch_size=1, 
+    shuffle=False
+)
+logger.log(f"Test dataset loaded: {len(test_dataset)} scenes")
+
+# Build U2Net model
+logger.log("Building U2Net model...")
+dim = configs.dim if hasattr(configs, 'dim') else 32
+img1_dim = configs.c_dim * 2
+img2_dim = configs.c_dim * 2
+H = configs.patch_size[0] if hasattr(configs, 'patch_size') else 64
+W = configs.patch_size[1] if hasattr(configs, 'patch_size') else 64
+
+model = U2Net(dim=dim, img1_dim=img1_dim, img2_dim=img2_dim, H=H, W=W)
+
+# Count parameters
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+logger.log(f"Total parameters: {total_params:,}")
+logger.log(f"Trainable parameters: {trainable_params:,}")
+
+# Setup device
+if configs.multigpu is False:
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+else:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == torch.device('cpu'):
+        raise EnvironmentError('No GPUs, cannot initialize multigpu training.')
+    model.to(device)
+
+logger.log(f"Using device: {device}")
+
+# Define optimizer
+optimizer = optim.Adam(
+    model.parameters(), 
+    betas=(configs.beta1, configs.beta2), 
+    lr=configs.learning_rate
+)
+logger.log(f"Optimizer: Adam (lr={configs.learning_rate}, betas=({configs.beta1}, {configs.beta2}))")
+
+# Define Criterion
+criterion = HDRLoss()
+
+# Define Scheduler
+lr_scheduler = PolyLR(optimizer, max_iter=configs.epoch, power=0.9)
+
+# Read checkpoints
+start_epoch = 0
+best_loss = float('inf')
+checkpoint_file = os.path.join(configs.checkpoint_dir, 'checkpoint.tar')
+
+if os.path.isfile(checkpoint_file):
+    logger.log(f"Loading checkpoint from {checkpoint_file}")
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch']
+    lr_scheduler.load_state_dict(checkpoint['scheduler'])
+    if 'best_loss' in checkpoint:
+        best_loss = checkpoint['best_loss']
+    logger.log(f"Loaded checkpoint (epoch {start_epoch}, best loss: {best_loss:.6f})")
+
+    eval_loss = eval_one_epoch(0)
+    logger.log(f"Eval Loss: {eval_loss:.8f}")
+else:
+    logger.log("No checkpoint found, starting from scratch")
+
+# Enable DataParallel if needed
+if configs.multigpu is True:
+    model = torch.nn.DataParallel(model)
+    logger.log(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+
+
+def train_one_epoch(epoch):
+    """Train for one epoch"""
+    model.train()
+    epoch_loss = 0.0
+    
+    # Progress bar
+    pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Train]')
+    
+    for idx, data in enumerate(pbar):
+        # Unpack data
+        img1_ldr, img2_ldr, img1_hdr, img2_hdr, sum1, sum2, ref_HDR = data
+        
+        # Move to device
+        img1_ldr = img1_ldr.to(device)
+        img2_ldr = img2_ldr.to(device)
+        img1_hdr = img1_hdr.to(device)
+        img2_hdr = img2_hdr.to(device)
+        sum1 = sum1.to(device)
+        sum2 = sum2.to(device)
+        ref_HDR = ref_HDR.to(device)
+        
+        # Prepare inputs
+        img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
+        img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
+        
+        # Forward pass
+        result = model(img1, img2, sum1, sum2)
+        
+        # Check for NaN/Inf in output (useful for debugging)
+        if torch.isnan(result).any() or torch.isinf(result).any():
+            logger.log(f"⚠️  Warning: Invalid values in model output at batch {idx+1}")
+            logger.log(f"   NaN count: {torch.isnan(result).sum().item()}")
+            logger.log(f"   Inf count: {torch.isinf(result).sum().item()}")
+            # Skip this batch
+            continue
+        
+        # Compute loss
+        loss = criterion(tonemap(result), tonemap(ref_HDR))
+        
+        # Check if loss is valid
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.log(f"⚠️  Warning: Invalid loss at batch {idx+1}, skipping")
+            continue
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        
+        # Log to tensorboard every 100 batches
+        if (idx + 1) % 100 == 0:
+            global_step = epoch * len(train_dataloader) + idx
+            writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+    
+    avg_loss = epoch_loss / len(train_dataloader)
+    return avg_loss
+
+
+def save_checkpoint(epoch, loss, best_loss, optimizer, model, lr_scheduler, is_best=False):
+    """Save checkpoint with proper handling of DataParallel"""
+    if configs.multigpu is False:
+        model_state = model.state_dict()
+    else:
+        model_state = model.module.state_dict()
+    
+    save_dict = {
+        'epoch': epoch + 1,
+        'loss': loss,
+        'best_loss': best_loss,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'model_state_dict': model_state,
+        'scheduler': lr_scheduler.state_dict(),
+        'config': {
+            'dim': dim,
+            'img1_dim': img1_dim,
+            'img2_dim': img2_dim,
+            'H': H,
+            'W': W,
+            'learning_rate': configs.learning_rate,
+            'batch_size': configs.batch_size
         }
-        num_batches = 0
-
-        for iteration, batch in enumerate(training_data_loader, 1):
-            gt, ldr1, ldr2, sum1, sum2 = [x.to(args.device) for x in batch]
-
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                # Forward pass
-                sr_log = model(ldr1, ldr2, sum1, sum2)
-                target_log = torch.log1p(gt.clamp(min=0))
-                
-                # Compute enhanced loss
-                loss, loss_dict = criterion(sr_log, target_log)
-                
-                # Safety check
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"\nWARNING: Invalid loss at epoch {epoch} iter {iteration}")
-                    print(f"  Loss components: {loss_dict}")
-                    continue
-
-            # Backward pass
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            
-            # Gradient clipping with adaptive threshold
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
-            # Safety checks with more lenient thresholds
-            if not torch.isfinite(torch.tensor(grad_norm)):
-                print(f"\nWARNING: Non-finite grad_norm at epoch {epoch} iter {iteration}")
-                optimizer.zero_grad()
-                scaler.update()
-                lr_scheduler.step()
-                continue
-
-            if grad_norm > 5000:
-                print(f"\nWARNING: Extreme grad_norm {grad_norm:.2f}, skipping")
-                optimizer.zero_grad()
-                scaler.update()
-                lr_scheduler.step()
-                continue
-            
-            scaler.step(optimizer)
-            scaler.update()
-            lr_scheduler.step()
-            
-            global_step += 1
-            epoch_loss += loss.item()
-            num_batches += 1
-            
-            # Accumulate metrics
-            for key, val in loss_dict.items():
-                epoch_metrics[key] += val
-
-            # Progress printing
-            if iteration % args.print_freq == 0:
-                avg_loss = epoch_loss / num_batches
-                print(f'\nEpoch {epoch}/{args.epoch} | Iter {iteration}/{len(training_data_loader)}')
-                print(f'  Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]["lr"]:.2e} | Grad: {grad_norm:.2f}')
-                print(f'  Components: L1={epoch_metrics["l1"]/num_batches:.4f} '
-                      f'Grad={epoch_metrics["grad"]/num_batches:.4f} '
-                      f'TM={epoch_metrics["tm"]/num_batches:.4f} '
-                      f'NegPen={epoch_metrics["neg_penalty"]/num_batches:.4f}')
+    }
+    
+    # Save latest checkpoint
+    checkpoint_path = os.path.join(configs.checkpoint_dir, 'checkpoint.tar')
+    torch.save(save_dict, checkpoint_path)
+    
+    # Save epoch checkpoint every N epochs
+    if (epoch + 1) % 5 == 0:
+        epoch_checkpoint_path = os.path.join(configs.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.tar')
+        torch.save(save_dict, epoch_checkpoint_path)
+    
+    # Save best model
+    if is_best:
+        best_checkpoint_path = os.path.join(configs.checkpoint_dir, 'best_checkpoint.tar')
+        torch.save(save_dict, best_checkpoint_path)
+    
+    return checkpoint_path
 
 
-            # Checkpoint every 200 iterations
-            if iteration % 200 == 0:
-                save_checkpoint(args, model, optimizer, lr_scheduler, iteration + epoch)
-                print(f"\nCheckpoint saved at iteration {iteration + epoch}!")
-    save_checkpoint(args, model, optimizer, lr_scheduler, epoch)
-    print("\nTraining completed!")
+def train(start_epoch):
+    """Main training loop"""
+    global best_loss
+    
+    logger.log("\n" + "="*80)
+    logger.log("Training Configuration:")
+    logger.log(f"  Epochs: {configs.epoch}")
+    logger.log(f"  Batch size: {configs.batch_size}")
+    logger.log(f"  Learning rate: {configs.learning_rate}")
+    logger.log(f"  Patch size: {configs.patch_size}")
+    logger.log(f"  Model dimension: {dim}")
+    logger.log(f"  Device: {device}")
+    logger.log("="*80 + "\n")
+    
+    training_start_time = time.time()
+    
+    for epoch in range(start_epoch, configs.epoch):
+        epoch_start_time = time.time()
+        
+        # Log epoch header
+        logger.log(f"\n{'='*80}")
+        logger.log(f"Epoch [{epoch + 1}/{configs.epoch}]")
+        logger.log(f"Learning rate: {lr_scheduler.get_last_lr()[0]:.8f}")
+        logger.log(f"{'='*80}")
+        
+        # Train
+        train_loss = train_one_epoch(epoch)
+        logger.log(f"Train Loss: {train_loss:.8f}")
+        
+        # Tensorboard logging
+        writer.add_scalar('Train/EpochLoss', train_loss, epoch)
+        writer.add_scalar('Train/LearningRate', lr_scheduler.get_last_lr()[0], epoch)
+        
+        # Update learning rate
+        lr_scheduler.step()
+        
+        # Save checkpoint
+        checkpoint_path = save_checkpoint(
+            epoch, 0, 0, optimizer, model, lr_scheduler, True
+        )
+        
+        # Evaluate
+        eval_loss = eval_one_epoch(epoch)
+        logger.log(f"Eval Loss: {eval_loss:.8f}")
+        
+        # Tensorboard logging
+        writer.add_scalar('Eval/Loss', eval_loss, epoch)
+        
+        # Check if best model
+        is_best = eval_loss < best_loss
+        if is_best:
+            logger.log(f"🎉 New best model! Loss improved from {best_loss:.8f} to {eval_loss:.8f}")
+            best_loss = eval_loss
+        
+        
+        # Epoch summary
+        epoch_time = time.time() - epoch_start_time
+        logger.log(f"Epoch time: {epoch_time:.2f}s")
+        logger.log(f"Checkpoint saved to: {checkpoint_path}")
+        
+        # Save training statistics
+        stats = {
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'eval_loss': eval_loss,
+            'best_loss': best_loss,
+            'learning_rate': lr_scheduler.get_last_lr()[0],
+            'epoch_time': epoch_time
+        }
+        
+        stats_file = os.path.join(log_dir, 'training_stats.json')
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                all_stats = json.load(f)
+        else:
+            all_stats = []
+        
+        all_stats.append(stats)
+        with open(stats_file, 'w') as f:
+            json.dump(all_stats, f, indent=2)
+    
+    # Training complete
+    total_time = time.time() - training_start_time
+    logger.log("\n" + "="*80)
+    logger.log("Training Completed!")
+    logger.log(f"Total training time: {total_time/3600:.2f} hours")
+    logger.log(f"Best validation loss: {best_loss:.8f}")
+    logger.log("="*80)
+    
+    writer.close()
 
 
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='HDR Image Reconstruction Training')
-
-    # Model architecture
-    parser.add_argument('--ratio', type=int, default=1,
-                        help='Internal processing ratio used by model')
-    parser.add_argument('--H', type=int, default=64,
-                        help='Tile height')
-    parser.add_argument('--W', type=int, default=64,
-                        help='Tile width')
-    parser.add_argument('--stride_H', type=int, default=32,
-                        help='Vertical stride for tile extraction')
-    parser.add_argument('--stride_W', type=int, default=32,
-                        help='Horizontal stride for tile extraction')
-    parser.add_argument('--channels', type=int, default=32,
-                        help='Number of feature channels')
-    parser.add_argument('--first_channels', type=int, default=3,
-                        help='Number of spatial channels')
-    parser.add_argument('--second_channels', type=int, default=3,
-                        help='Number of spectral channels')
-
-    # Loss function
-    parser.add_argument('--ergas_hp', type=float, default=1e-4,
-                        help='Weight for ERGAS loss')
-
-    # Training parameters
-    parser.add_argument('--epoch', type=int, default=500,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=20,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=5e-4,
-                        help='Initial learning rate')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of data loader workers')
-
-    # DataLoader optimization features
-    parser.add_argument('--summary_only', type=bool, default=True)
-    parser.add_argument('--disk_max_size_bytes', type=int, default=5 * (1024 ** 3))
-    parser.add_argument('--num_load_threads', type=int, default=4,
-                        help='Number of parallel image loading threads')
-    parser.add_argument('--use_disk_cache', action='store_true',
-                        help='Cache preprocessed tiles to disk')
-    parser.add_argument('--disk_cache_dir', type=str, default='./tile_cache',
-                        help='Directory for disk cache')
-    parser.add_argument('--max_cached_pairs', type=int, default=16,
-                        help='Maximum number of pairs to keep in memory cache')
-    parser.add_argument('--use_smart_sampler', action='store_true',
-                        help='Use smart sampler for better cache locality')
-
-    # Checkpointing and validation
-    parser.add_argument('--ckpt', type=int, default=20,
-                        help='Save checkpoint every N epochs')
-    parser.add_argument('--val_freq', type=int, default=1,
-                        help='Run validation every N epochs')
-    parser.add_argument('--print_freq', type=int, default=10,
-                        help='Print training stats every N iterations')
-    parser.add_argument('--save_debug', action='store_true',
-                        help='Save debug images from first batch')
-
-    # Paths
-    parser.add_argument('--device', type=str, default='cuda',
-                        choices=['cuda', 'cpu'])
-    parser.add_argument('--train_data_path', type=str, default=None,
-                        help='Path to training dataset (use when not using --split_csv)')
-    parser.add_argument('--val_data_path', type=str, default=None,
-                        help='Path to validation dataset (use when not using --split_csv)')
-    parser.add_argument('--data_dir', type=str, default=None,
-                        help='Path to full dataset (use with --split_csv)')
-    parser.add_argument('--split_csv', type=str, default=None,
-                        help="Path to CSV/TSV file with columns 'scene' and 'split' (use with --data_dir)")
-    parser.add_argument('--weight_dir', type=str, default='weights/',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--resume_path', type=str, default=None,
-                        help='Path to checkpoint to resume from')
-
-    args = parser.parse_args()
-
-    # Validate arguments
-    if args.H <= 0 or args.W <= 0:
-        raise ValueError("Tile dimensions (H, W) must be positive")
-    if args.stride_H <= 0 or args.stride_W <= 0:
-        raise ValueError("Stride dimensions must be positive")
-    if args.stride_H > args.H or args.stride_W > args.W:
-        print("Warning: Stride larger than tile size will create gaps in coverage")
-
-    print("\n" + "="*80)
-    print("Training Configuration:")
-    print("="*80)
-    print(f"  Device: {args.device}")
-    print(f"  Tile size: {args.H}x{args.W}")
-    print(f"  Stride: {args.stride_H}x{args.stride_W}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Epochs: {args.epoch}")
-    print(f"  Learning rate: {args.lr}")
-    print("="*80)
-
-    training_data_loader, train_set = prepare_training_data(args)
-
-    train(args, training_data_loader, train_set)
-
+if __name__ == '__main__':
+    try:
+        logger.log("Starting training...")
+        train(start_epoch)
+        logger.log("Training finished successfully!")
+    except Exception as e:
+        logger.log(f"Error during training: {str(e)}")
+        import traceback
+        logger.log(traceback.format_exc())
+        raise
+    finally:
+        writer.close()
