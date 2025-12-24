@@ -15,6 +15,7 @@ import math
 # 2. HDRHead → Tanh for [-1, 1] output (not Sigmoid!)
 # 3. Zero-centered initialization and processing
 # 4. Conservative attention to prevent range violations
+# 5. Skip gate for orig_img1 → output connection
 # =============================================================================
 
 
@@ -23,12 +24,10 @@ class DynamicRangeNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        # For pre-normalized inputs, just use learnable scaling
         self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1))
         self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
         
     def forward(self, x):
-        # Skip heavy normalization, just apply affine transform
         return self.gamma * x + self.beta
 
 
@@ -132,6 +131,61 @@ class Stage(nn.Module):
             return img1, img2, img1_sum, img2_sum
 
 
+class SkipGate(nn.Module):
+    """
+    Learnable skip gate for connecting processed features to output.
+    Operates in feature space for better semantic alignment.
+    Optimized for [-1, 1] normalized data.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        # Adaptive gating network
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(in_channels // 4, 1, 1),
+            nn.Sigmoid()
+        )
+        
+        # Channel adaptation if needed
+        self.adapt_channels = None
+        if in_channels != out_channels:
+            self.adapt_channels = nn.Conv2d(in_channels, out_channels, 1)
+        
+        # Learnable weight for skip strength
+        self.skip_weight = nn.Parameter(torch.tensor(0.15))
+        
+        # Initialize gate to output low values initially
+        nn.init.constant_(self.gate_conv[-2].bias, -2.0)
+        
+    def forward(self, skip_input, network_output):
+        """
+        Args:
+            skip_input: Processed features from img1 (B, C_in, H, W) in feature space
+            network_output: Network processed output (B, C_out, H, W) in [-1, 1]
+        
+        Returns:
+            Gated combination in [-1, 1] range
+        """
+        # Compute adaptive gate based on input content
+        gate = self.gate_conv(skip_input)  # (B, 1, H, W) in [0, 1]
+        
+        # Adapt channels if necessary
+        skip = skip_input
+        if self.adapt_channels is not None:
+            skip = self.adapt_channels(skip)
+        
+        # Apply gated skip connection with learnable weight
+        # gate * skip_weight controls how much original content to preserve
+        output = network_output + skip * gate * self.skip_weight
+        
+        # Ensure output stays in [-1, 1] range
+        output = torch.clamp(output, -1.0, 1.0)
+        
+        return output
+
+
 class HDRHead(nn.Module):
     """HDR head optimized for normalized inputs/outputs [-1, 1]"""
     def __init__(self, dim, out_channels):
@@ -145,7 +199,7 @@ class HDRHead(nn.Module):
             nn.InstanceNorm2d(dim // 2, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(dim // 2, out_channels, 3, 1, 1),
-            nn.Tanh()  # Output [-1, 1] for normalized data
+            nn.Tanh()
         )
         
         # Initialize final layer to output near 0 (center of range)
@@ -216,6 +270,9 @@ class U2Net(nn.Module):
         )
         
         self.to_hdr = HDRHead(dim, img2_dim // 2)
+        
+        # NEW: Skip gate for feature-level skip connection
+        self.skip_gate = SkipGate(dim, img2_dim // 2)
 
         # Dimensions for each stage
         dim0 = dim
@@ -252,13 +309,12 @@ class U2Net(nn.Module):
         self.color_blend_alpha = nn.Parameter(torch.tensor(0.12))
 
     def forward(self, img1, img2, sum1, sum2):
-
         img1 = self.raise_img1_dim(img1)
         img2 = self.raise_img2_dim(img2)
         sum1 = self.raise_img1_sum_dim(sum1)
         sum2 = self.raise_img2_sum_dim(sum2)
 
-        # Store original for residual
+        # Store for both skip gate and color preservation
         img1_orig = img1
         img2_orig = img2
 
@@ -291,53 +347,10 @@ class U2Net(nn.Module):
         # Add small residual - network does most of the work
         output = output + color_residual * self.color_blend_alpha
 
+        # Generate HDR output
         output_hdr = self.to_hdr(output)
+        
+        # NEW: Apply skip gate with feature-level img1
+        output_hdr = self.skip_gate(img1_orig, output_hdr)
 
         return output_hdr
-    
-    def print_statistics(self, img1, img2, sum1, sum2, output):
-        """Debug helper - call this during evaluation to see what's happening"""
-        print(f"\nInput ranges:")
-        print(f"  img1: [{img1.min():.3f}, {img1.max():.3f}], mean: {img1.mean():.3f}")
-        print(f"  img2: [{img2.min():.3f}, {img2.max():.3f}], mean: {img2.mean():.3f}")
-        print(f"\nOutput ranges:")
-        print(f"  output: [{output.min():.3f}, {output.max():.3f}], mean: {output.mean():.3f}")
-        print(f"  color_blend_alpha: {self.color_blend_alpha.item():.3f}")
-        
-        # Check if output is clipped at boundaries
-        near_min = (output < -0.95).float().mean() * 100
-        near_max = (output > 0.95).float().mean() * 100
-        print(f"  % pixels near -1.0: {near_min:.2f}%")
-        print(f"  % pixels near +1.0: {near_max:.2f}%")
-        if near_min > 5 or near_max > 5:
-            print("  WARNING: Many pixels clipped at boundaries!")
-
-
-# =============================================================================
-# TUNING GUIDE FOR NORMALIZED INPUTS [-1, 1]
-# =============================================================================
-# 
-# Your inputs are pre-normalized, so the network should do most of the work.
-# The color_blend_alpha controls how much original color to inject.
-#
-# If output is GREY/DESATURATED:
-# 1. Increase color_blend_alpha: 0.1 → 0.15 → 0.20 → 0.25
-# 2. Increase SpeAttention range: attention * 0.3 + 0.85 → attention * 0.5 + 0.75
-# 3. Reduce final_refine scaling: 0.1 → 0.05 (less smoothing)
-#
-# If output is OVERSATURATED/TOO BRIGHT:
-# 1. Decrease color_blend_alpha: 0.1 → 0.05 → 0.03
-# 2. Decrease SpeAttention range: attention * 0.3 + 0.85 → attention * 0.2 + 0.9
-# 3. Check HDRHead initialization gain (currently 0.2, can go to 0.1)
-# 4. Ensure your loss function isn't pushing outputs to extremes
-#
-# If output is CORRECT color but WRONG range:
-# - HDRHead outputs [0, 1] via Sigmoid
-# - If your targets are in different range, remove Sigmoid and add appropriate scaling
-# - Example for [0, 10]: return self.conv(x) * 10
-#
-# Debug tips:
-# - Print ranges: print(f"Output: {output.min():.3f} to {output.max():.3f}")
-# - Visualize attention: save attn1.mean() and attn2.mean() to see if they're reasonable
-# - Check if problem is in network vs HDRHead: print intermediate 'output' before to_hdr()
-# =============================================================================

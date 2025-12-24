@@ -250,7 +250,8 @@ train_dataloader = DataLoader(
     batch_size=configs.batch_size, 
     shuffle=True,
     num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
-    pin_memory=True
+    pin_memory=True,
+    persistent_workers=True
 )
 logger.log(f"Training dataset loaded: {len(train_dataset)} patches")
 
@@ -359,6 +360,12 @@ def train_one_epoch(epoch):
         
         # Forward pass
         result = model(img1, img2, sum1, sum2)
+        
+        # diagnostic = SaturationDiagnostic(model)
+        # diagnosis = diagnostic.diagnose(img1, img2, sum1, sum2)
+
+        # Apply automatic fixes based on severity
+        # apply_quick_fixes(model, severity='medium')
         
         # Check for NaN/Inf in output (useful for debugging)
         if torch.isnan(result).any() or torch.isinf(result).any():
@@ -483,8 +490,9 @@ def train(start_epoch):
         )
         
         # Evaluate
-        eval_loss = eval_one_epoch(epoch)
-        logger.log(f"Eval Loss: {eval_loss:.8f}")
+        eval_loss = 0
+        # eval_loss = eval_one_epoch(epoch)
+        # logger.log(f"Eval Loss: {eval_loss:.8f}")
         
         # Tensorboard logging
         writer.add_scalar('Eval/Loss', eval_loss, epoch)

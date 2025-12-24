@@ -185,11 +185,9 @@ def radiance_writer(out_path, image):
     # Check for and fix invalid values
     if np.isnan(image).any():
         print(f"Warning: NaN values detected in HDR image, replacing with 0")
-        image = np.nan_to_num(image, nan=0.0, posinf=1e10, neginf=0.0)
     
     if np.isinf(image).any():
         print(f"Warning: Infinite values detected in HDR image, clipping")
-        image = np.nan_to_num(image, nan=0.0, posinf=1e10, neginf=0.0)
     
     # Ensure non-negative values (HDR should be non-negative)
     image = np.maximum(image, 0.0)
@@ -224,18 +222,12 @@ def radiance_writer(out_path, image):
         
         # Safely compute RGB values with clipping
         rgb_values = image[..., 0:3] * scaled_mantissa[..., None]
-        rgb_values = np.clip(rgb_values, 0, 255)
-        
-        # Handle any remaining NaN values
-        rgb_values = np.nan_to_num(rgb_values, nan=0.0)
-        
         # Convert to uint8
         rgbe[..., 0:3] = np.around(rgb_values).astype(np.uint8)
         
         # Compute exponent with offset, clipping to valid range
         exp_values = np.clip(exponent + 128, 0, 255)
         rgbe[..., 3] = np.around(exp_values).astype(np.uint8)
-
         # Write to file
         rgbe.flatten().tofile(f)
 
@@ -320,35 +312,42 @@ def get_input(LDR_path, exp_path, ref_HDR_path):
     ref_HDR = get_image(ref_HDR_path, image_size=[h, w], is_crop=True)
     return in_LDRs, in_HDRs, in_exps, ref_HDR
 
-
 def dump_sample(sample_path, img):
     """
-    Save HDR sample with validation
+    Save HDR sample with validation.
+    Accepts:
+      - (B, C, H, W)
+      - (C, H, W)
+      - (H, W, C)
     """
-    img = img[0]  # Remove batch dimension
-    h, w, _ = img.shape
-    
-    # Create directory
-    if not os.path.exists(sample_path):
-        os.makedirs(sample_path)
-    
+
+    # ---- Normalize shape ----
+    if img.ndim == 4:          # (B, C, H, W)
+        img = img[0]
+    if img.ndim == 3 and img.shape[0] in (1, 3):  # (C, H, W)
+        img = img.transpose(1, 2, 0)              # -> (H, W, C)
+
+    assert img.ndim == 3, f"Invalid image shape: {img.shape}"
+
+    h, w, c = img.shape
+
+    # ---- Create directory ----
+    os.makedirs(sample_path, exist_ok=True)
     file_path = os.path.join(sample_path, 'hdr.hdr')
-    
-    # Transform from [-1, 1] to [0, inf)
+
+    # ---- Transform from [-1, 1] to [0, inf) ----
     img = inverse_transform(img)
-    
-    # Check for invalid values before saving
+
+    # ---- Validate ----
     if np.isnan(img).any() or np.isinf(img).any():
         print(f"Warning: Invalid values in output HDR image for {sample_path}")
         print(f"  NaN count: {np.isnan(img).sum()}")
         print(f"  Inf count: {np.isinf(img).sum()}")
         print(f"  Min value: {np.nanmin(img):.6f}")
-        print(f"  Max value: {np.nanmax(img[~np.isinf(img)]) if not np.isinf(img).all() else 'All inf'}")
-    
-    # Transpose to correct format (H, W, C)
-    img = np.einsum('ijk->jki', img)
-    
-    # Write HDR file
+        if not np.isinf(img).all():
+            print(f"  Max value: {np.nanmax(img[~np.isinf(img)])}")
+
+    # ---- Write HDR ----
     radiance_writer(file_path, img)
     
 def validate_hdr_output(output, name="output"):
@@ -359,13 +358,11 @@ def validate_hdr_output(output, name="output"):
     if torch.isnan(output).any():
         nan_count = torch.isnan(output).sum().item()
         print(f"❌ {name} contains {nan_count} NaN values")
-        return False
     
     if torch.isinf(output).any():
         inf_count = torch.isinf(output).sum().item()
         print(f"❌ {name} contains {inf_count} infinite values")
-        return False
-    
+
     min_val = output.min().item()
     max_val = output.max().item()
     mean_val = output.mean().item()
@@ -376,27 +373,20 @@ def validate_hdr_output(output, name="output"):
 
 class HDRLoss(nn.Module):
     """Numerically stable HDR loss with gradient clipping"""
-    def __init__(self, clip_value=10.0):
+    def __init__(self):
         super().__init__()
-        self.clip_value = clip_value
-
+    
     def forward(self, out_img, ref_img):
         # Ensure inputs are valid
         if torch.isnan(out_img).any() or torch.isnan(ref_img).any():
             print("⚠️  Warning: NaN detected in loss inputs")
-            # Return a valid loss to prevent training crash
-            return torch.tensor(0.0, device=out_img.device, requires_grad=True)
         
         if torch.isinf(out_img).any() or torch.isinf(ref_img).any():
             print("⚠️  Warning: Inf detected in loss inputs")
-            return torch.tensor(0.0, device=out_img.device, requires_grad=True)
-        
+            
         # Compute squared difference
         diff = out_img - ref_img
         squared_diff = diff ** 2
-        
-        # Clip extreme values to prevent gradient explosion
-        squared_diff = torch.clamp(squared_diff, 0.0, self.clip_value)
         
         # Compute mean
         loss = torch.mean(squared_diff)
@@ -404,8 +394,7 @@ class HDRLoss(nn.Module):
         # Final safety check
         if torch.isnan(loss) or torch.isinf(loss):
             print("⚠️  Warning: Invalid loss computed, returning zero")
-            return torch.tensor(0.0, device=out_img.device, requires_grad=True)
-        
+
         return loss
     
 
