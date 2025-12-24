@@ -8,14 +8,7 @@ import math
 
 
 # =============================================================================
-# OPTIMIZED FOR PRE-NORMALIZED INPUTS [-1, 1]
-# =============================================================================
-# Key changes for [-1, 1] normalized data:
-# 1. DynamicRangeNorm → Simple affine transform (no mean/var normalization)
-# 2. HDRHead → Tanh for [-1, 1] output (not Sigmoid!)
-# 3. Zero-centered initialization and processing
-# 4. Conservative attention to prevent range violations
-# 5. Skip gate for orig_img1 → output connection
+# FIXED VERSION - Addresses checkerboard, statistics, and convergence issues
 # =============================================================================
 
 
@@ -32,6 +25,7 @@ class DynamicRangeNorm(nn.Module):
 
 
 class ExposureAwareAttention(nn.Module):
+    """Conservative attention to prevent range violations"""
     def __init__(self, channels, reduction=8):
         super().__init__()
         
@@ -51,16 +45,20 @@ class ExposureAwareAttention(nn.Module):
         max_out = self.max_pool(x)
         combined = torch.cat([avg_out, max_out], dim=1)
         attention = self.sigmoid(self.fc(combined))
-        # FIX: Moderate attention for [-1, 1] range
-        return x * (attention * 0.4 + 0.8)  # Range [0.8, 1.2]
+        
+        # FIX: More conservative scaling [0.85, 1.15]
+        return x * (attention * 0.3 + 0.85)
 
 
 class Up(nn.Module):
+    """FIXED: No more checkerboard artifacts!"""
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
         
+        # FIX: Use Upsample + Conv instead of ConvTranspose2d
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, scale, scale, 0),
+            nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1),  # Regular conv after upsample
             DynamicRangeNorm(out_channels),
             nn.LeakyReLU(0.2, inplace=True)
         )
@@ -80,7 +78,7 @@ class Up(nn.Module):
         x = torch.cat([x1, x2], dim=1)
         x = self.conv(x)
         x = self.attention(x)
-        return x + x1
+        return x + x1 * 0.5  # Dampen residual
 
 
 class Down(nn.Module):
@@ -131,87 +129,36 @@ class Stage(nn.Module):
             return img1, img2, img1_sum, img2_sum
 
 
-class SkipGate(nn.Module):
-    """
-    Learnable skip gate for connecting processed features to output.
-    Operates in feature space for better semantic alignment.
-    Optimized for [-1, 1] normalized data.
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        
-        # Adaptive gating network
-        self.gate_conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 4, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(in_channels // 4, 1, 1),
-            nn.Sigmoid()
-        )
-        
-        # Channel adaptation if needed
-        self.adapt_channels = None
-        if in_channels != out_channels:
-            self.adapt_channels = nn.Conv2d(in_channels, out_channels, 1)
-        
-        # Learnable weight for skip strength
-        self.skip_weight = nn.Parameter(torch.tensor(0.15))
-        
-        # Initialize gate to output low values initially
-        nn.init.constant_(self.gate_conv[-2].bias, -2.0)
-        
-    def forward(self, skip_input, network_output):
-        """
-        Args:
-            skip_input: Processed features from img1 (B, C_in, H, W) in feature space
-            network_output: Network processed output (B, C_out, H, W) in [-1, 1]
-        
-        Returns:
-            Gated combination in [-1, 1] range
-        """
-        # Compute adaptive gate based on input content
-        gate = self.gate_conv(skip_input)  # (B, 1, H, W) in [0, 1]
-        
-        # Adapt channels if necessary
-        skip = skip_input
-        if self.adapt_channels is not None:
-            skip = self.adapt_channels(skip)
-        
-        # Apply gated skip connection with learnable weight
-        # gate * skip_weight controls how much original content to preserve
-        output = network_output + skip * gate * self.skip_weight
-        
-        # Ensure output stays in [-1, 1] range
-        output = torch.clamp(output, -1.0, 1.0)
-        
-        return output
-
-
 class HDRHead(nn.Module):
-    """HDR head optimized for normalized inputs/outputs [-1, 1]"""
+    """FIXED: Constrained output for [-1, 1] range"""
     def __init__(self, dim, out_channels):
         super().__init__()
-        
+        num_groups = math.gcd(8, dim)  # largest divisor ≤ 8
         self.conv = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.InstanceNorm2d(dim, affine=True),
+            nn.GroupNorm(num_groups, dim),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(dim, dim // 2, 3, 1, 1),
-            nn.InstanceNorm2d(dim // 2, affine=True),
+            nn.GroupNorm(num_groups//2, dim // 2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim // 2, out_channels, 3, 1, 1),
-            nn.Tanh()
+            nn.Conv2d(dim // 2, out_channels, 3, 1, 1)
         )
         
-        # Initialize final layer to output near 0 (center of range)
-        nn.init.xavier_uniform_(self.conv[-2].weight, gain=0.3)
-        nn.init.constant_(self.conv[-2].bias, 0.0)
+        # FIX: Conservative initialization
+        nn.init.xavier_uniform_(self.conv[-1].weight, gain=0.5)
+        nn.init.constant_(self.conv[-1].bias, 0.0)
+        
+        # FIX: Soft tanh constraint to keep output near [-1, 1]
+        self.output_scale = nn.Parameter(torch.tensor(1.2))
         
     def forward(self, x):
-        return self.conv(x)
+        output = self.conv(x)
+        # Soft constraint: allows slight excursion beyond [-1, 1] but pulls back
+        return torch.tanh(output) * self.output_scale
 
 
 class SpeAttention(nn.Module):
-    """FIXED: Less aggressive attention scaling"""
+    """Conservative spectral attention"""
     def __init__(self, channels=32):
         super().__init__()
         
@@ -235,8 +182,8 @@ class SpeAttention(nn.Module):
         
         attention = self.block(combined).unsqueeze(-1)
         
-        # FIX: Centered around 1.0 for [-1, 1] data
-        attention = attention * 0.25 + 0.875  # Range [0.875, 1.125]
+        # FIX: Very conservative range [0.95, 1.05]
+        attention = attention * 0.1 + 0.95
         
         return attention
 
@@ -246,7 +193,7 @@ class U2Net(nn.Module):
     def __init__(self, dim, img1_dim, img2_dim, H=64, W=64):
         super().__init__()
 
-        # Input projection layers - keep some normalization for stability
+        # Input projection layers
         self.raise_img1_dim = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
             DynamicRangeNorm(dim),
@@ -270,9 +217,6 @@ class U2Net(nn.Module):
         )
         
         self.to_hdr = HDRHead(dim, img2_dim // 2)
-        
-        # NEW: Skip gate for feature-level skip connection
-        self.skip_gate = SkipGate(dim, img2_dim // 2)
 
         # Dimensions for each stage
         dim0 = dim
@@ -286,27 +230,19 @@ class U2Net(nn.Module):
         self.stage3 = Stage(dim1, dim0, H//2, W//2, sample_mode='up')
         self.stage4 = FusionMamba(dim0, H, W, depth=3, final=True)
         
-        # Feature refinement - keep it light
-        self.feature_refine = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, 1, 1),
-                DynamicRangeNorm(dim),
-                nn.LeakyReLU(0.2, inplace=True)
-            ) for _ in range(2)
-        ])
-        
-        self.final_refine = nn.Sequential(
+        # FIX: Simpler, lighter feature refinement
+        self.feature_refine = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim, dim, 1, 1, 0)
+            DynamicRangeNorm(dim),
+            nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # FIX: Use spectral attention for intelligent color preservation
+        # FIX: Use spectral attention for color
         self.spe_attn1 = SpeAttention(channels=dim)
         self.spe_attn2 = SpeAttention(channels=dim)
         
-        # For [-1, 1] normalized inputs, use small residual weight
-        self.color_blend_alpha = nn.Parameter(torch.tensor(0.12))
+        # FIX: Very small color blend
+        self.color_blend_alpha = nn.Parameter(torch.tensor(0.05))
 
     def forward(self, img1, img2, sum1, sum2):
         img1 = self.raise_img1_dim(img1)
@@ -314,7 +250,7 @@ class U2Net(nn.Module):
         sum1 = self.raise_img1_sum_dim(sum1)
         sum2 = self.raise_img2_sum_dim(sum2)
 
-        # Store for both skip gate and color preservation
+        # Store originals
         img1_orig = img1
         img2_orig = img2
 
@@ -329,28 +265,18 @@ class U2Net(nn.Module):
         # Final fusion
         output = self.stage4(img1, img2, sum1, sum2)
 
-        # FIX: Lighter feature refinement with residual scaling
-        for i, refine_layer in enumerate(self.feature_refine):
-            scale = 0.3 ** (i + 1)  # Lighter scaling for normalized data
-            output = output + refine_layer(output) * scale
-        
-        output = output + self.final_refine(output) * 0.15  # Slightly higher for [-1,1]
+        # FIX: Single refinement pass
+        output = output + self.feature_refine(output) * 0.2
 
-        # FIX: Conservative color preservation for normalized inputs
-        # Add small amount of original color back
+        # FIX: Minimal color preservation
         attn1 = self.spe_attn1(img1_orig)
         attn2 = self.spe_attn2(img2_orig)
-        
-        # Weighted average of original inputs
         color_residual = (img1_orig * attn1 + img2_orig * attn2) * 0.5
-        
-        # Add small residual - network does most of the work
         output = output + color_residual * self.color_blend_alpha
 
-        # Generate HDR output
-        output_hdr = self.to_hdr(output)
-        
-        # NEW: Apply skip gate with feature-level img1
-        output_hdr = self.skip_gate(img1_orig, output_hdr)
+        # Generate HDR output (now constrained by tanh)
+        output = self.to_hdr(output)
 
-        return output_hdr
+        output = torch.clamp(output, -1.0, 1.0)
+
+        return output

@@ -3,13 +3,25 @@ import cv2
 from glob import glob
 import numpy as np
 from torch.utils.data import Dataset
-from utils.tools import get_image
-from utils.tools import LDR2HDR_batch
+from utils.tools import get_image, LDR2HDR_batch, LDR2HDR
+
+
+def create_global_summary(full_image, target_size):
+    h, w, c = full_image.shape
+    target_h, target_w = target_size
+    
+    # Use area interpolation (best for downsampling)
+    summary = cv2.resize(full_image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    
+    return summary
+
 
 class U2NetDataset(Dataset):
     """
-    Dataset for U2Net HDR reconstruction
-    Prepares paired LDR images with their summaries for fusion
+    Dataset for U2Net HDR reconstruction.
+    - Each image gets its OWN global summary
+    - Randomly samples pairs of exposures for training diversity
+    - No caching to avoid OOM
     """
     def __init__(self, configs,
                  input_name='input_*_aligned.tif',
@@ -20,7 +32,6 @@ class U2NetDataset(Dataset):
         super().__init__()
         print('====> Start preparing U2Net training data.')
 
-        # Basic information
         self.filepath = os.path.join(configs.data_path, 'train')
         self.scene_dirs = [scene_dir for scene_dir in os.listdir(self.filepath)
                             if os.path.isdir(os.path.join(self.filepath, scene_dir))]
@@ -74,7 +85,17 @@ class U2NetDataset(Dataset):
         if scene_idx == -1:
             raise ValueError('Index out of bound')
 
+        scene_dir = self.scene_dirs[scene_idx]
+        
+        # Load image paths
         in_LDR_paths = sorted(glob(os.path.join(cur_scene_dir, self.input_name)))
+        
+        # Load exposures
+        in_exp_path = os.path.join(cur_scene_dir, self.input_exp_name)
+        in_exp = np.array(open(in_exp_path).read().split('\n')[:self.num_shots]).astype(np.float32)
+        in_exp = 2 ** in_exp
+        
+        # Get image dimensions from first image
         tmp_img = get_image(in_LDR_paths[0])
         h, w, c = tmp_img.shape
 
@@ -96,62 +117,94 @@ class U2NetDataset(Dataset):
             w_left = w - self.patch_size[1]
             w_right = w
 
-        # Load input LDR images
-        in_LDR = np.zeros((self.patch_size[0], self.patch_size[1], c * self.num_shots))
-        for j, in_LDR_path in enumerate(in_LDR_paths):
-            in_LDR[:, :, j * c:(j + 1) * c] = get_image(in_LDR_path)[h_up:h_down, w_left:w_right, :]
-        in_LDR = np.array(in_LDR).astype(np.float32)
+        # ================================================================
+        # EXPOSURE PAIR SELECTION:
+        # - img1 = ALWAYS middle exposure (motion reference)
+        # - img2 = randomly selected from OTHER exposures
+        # ================================================================
+        # Middle exposure is the motion reference
+        idx1 = self.num_shots // 2
+        
+        if self.num_shots >= 2:
+            # Select img2 from all exposures EXCEPT the middle one
+            other_indices = [i for i in range(self.num_shots) if i != idx1]
+            idx2 = np.random.choice(other_indices)
+        else:
+            idx2 = 0  # Fallback if only one exposure
+        
+        # ================================================================
+        # Load ONLY the two selected exposures (no full image loading)
+        # ================================================================
+        
+        # Load patches for the two selected exposures
+        img1_ldr_patch = get_image(in_LDR_paths[idx1])[h_up:h_down, w_left:w_right, :]
+        img2_ldr_patch = get_image(in_LDR_paths[idx2])[h_up:h_down, w_left:w_right, :]
+        
+        # Convert to HDR (use LDR2HDR for single exposure, not LDR2HDR_batch)
+        img1_hdr_patch = LDR2HDR(img1_ldr_patch, in_exp[idx1])
+        img2_hdr_patch = LDR2HDR(img2_ldr_patch, in_exp[idx2])
+        
+        # Load FULL images for summaries (needed for global context)
+        img1_ldr_full = get_image(in_LDR_paths[idx1])
+        img2_ldr_full = get_image(in_LDR_paths[idx2])
+        
+        # Convert to HDR (use LDR2HDR for single exposure)
+        img1_hdr_full = LDR2HDR(img1_ldr_full, in_exp[idx1])
+        img2_hdr_full = LDR2HDR(img2_ldr_full, in_exp[idx2])
 
-        # Load exposures
-        in_exp_path = os.path.join(cur_scene_dir, self.input_exp_name)
-        in_exp = np.array(open(in_exp_path).read().split('\n')[:self.num_shots]).astype(np.float32)
-
-        # Load reference HDR
+        # Load reference HDR (patch only)
         ref_HDR = get_image(os.path.join(cur_scene_dir, self.ref_hdr_name))[h_up:h_down, w_left:w_right, :]
 
+        # ================================================================
         # Apply random augmentations
+        # ================================================================
         distortions = np.random.uniform(0.0, 1.0, 2)
         
         # Horizontal flip
         if distortions[0] < 0.5:
-            in_LDR = np.flip(in_LDR, axis=1)
+            img1_ldr_patch = np.flip(img1_ldr_patch, axis=1)
+            img2_ldr_patch = np.flip(img2_ldr_patch, axis=1)
+            img1_hdr_patch = np.flip(img1_hdr_patch, axis=1)
+            img2_hdr_patch = np.flip(img2_hdr_patch, axis=1)
             ref_HDR = np.flip(ref_HDR, axis=1)
+            
+            img1_ldr_full = np.flip(img1_ldr_full, axis=1)
+            img2_ldr_full = np.flip(img2_ldr_full, axis=1)
+            img1_hdr_full = np.flip(img1_hdr_full, axis=1)
+            img2_hdr_full = np.flip(img2_hdr_full, axis=1)
 
         # Rotation
         k = int(distortions[1] * 4 + 0.5)
-        in_LDR = np.rot90(in_LDR, k)
+        img1_ldr_patch = np.rot90(img1_ldr_patch, k)
+        img2_ldr_patch = np.rot90(img2_ldr_patch, k)
+        img1_hdr_patch = np.rot90(img1_hdr_patch, k)
+        img2_hdr_patch = np.rot90(img2_hdr_patch, k)
         ref_HDR = np.rot90(ref_HDR, k)
         
-        # Convert exposures
-        in_exp = 2 ** in_exp
-
-        # Convert LDR to HDR
-        in_HDR = LDR2HDR_batch(in_LDR, in_exp)
-
-        # Prepare pairs for U2Net: use first two exposures as img1 and img2
-        # img1: first exposure (LDR + HDR)
-        # img2: second exposure (LDR + HDR)
-        # sum1: average of all LDR images
-        # sum2: average of all HDR images
+        img1_ldr_full = np.rot90(img1_ldr_full, k)
+        img2_ldr_full = np.rot90(img2_ldr_full, k)
+        img1_hdr_full = np.rot90(img1_hdr_full, k)
+        img2_hdr_full = np.rot90(img2_hdr_full, k)
         
-        img1_ldr = in_LDR[:, :, 0:c]
-        img2_ldr = in_LDR[:, :, c:c*2]
-        img1_hdr = in_HDR[:, :, 0:c]
-        img2_hdr = in_HDR[:, :, c:c*2]
+        # ================================================================
+        # Create GLOBAL summaries (one for EACH exposure)
+        # Downsample to patch size
+        # ================================================================
+        sum1_ldr = create_global_summary(img1_ldr_full, self.patch_size)
+        sum1_hdr = create_global_summary(img1_hdr_full, self.patch_size)
+        sum2_ldr = create_global_summary(img2_ldr_full, self.patch_size)
+        sum2_hdr = create_global_summary(img2_hdr_full, self.patch_size)
         
-        # Create summaries (mean across all exposures) - concatenate LDR and HDR
-        sum_ldr = np.mean(in_LDR.reshape(self.patch_size[0], self.patch_size[1], self.num_shots, c), axis=2)
-        sum_hdr = np.mean(in_HDR.reshape(self.patch_size[0], self.patch_size[1], self.num_shots, c), axis=2)
-        
-        # Concatenate to match img1/img2 structure (6 channels total)
-        sum1 = np.concatenate([sum_ldr, sum_hdr], axis=2)
-        sum2 = np.concatenate([sum_ldr, sum_hdr], axis=2)
+        # Concatenate LDR and HDR for each summary (6 channels: 3 LDR + 3 HDR)
+        # This matches img1 = cat([img1_ldr, img1_hdr]) which is also 6 channels
+        sum1 = np.concatenate([sum1_ldr, sum1_hdr], axis=2)
+        sum2 = np.concatenate([sum2_ldr, sum2_hdr], axis=2)
         
         # Transpose to PyTorch format (C, H, W)
-        img1_ldr = np.einsum("ijk->kij", img1_ldr)
-        img2_ldr = np.einsum("ijk->kij", img2_ldr)
-        img1_hdr = np.einsum("ijk->kij", img1_hdr)
-        img2_hdr = np.einsum("ijk->kij", img2_hdr)
+        img1_ldr = np.einsum("ijk->kij", img1_ldr_patch)
+        img2_ldr = np.einsum("ijk->kij", img2_ldr_patch)
+        img1_hdr = np.einsum("ijk->kij", img1_hdr_patch)
+        img2_hdr = np.einsum("ijk->kij", img2_hdr_patch)
         sum1 = np.einsum("ijk->kij", sum1)
         sum2 = np.einsum("ijk->kij", sum2)
         ref_HDR = np.einsum("ijk->kij", ref_HDR)
@@ -167,7 +220,9 @@ class U2NetDataset(Dataset):
 
 class U2NetTestDataset(Dataset):
     """
-    Test dataset for U2Net HDR reconstruction
+    Test dataset for U2Net HDR reconstruction.
+    - Each image gets its OWN global summary
+    - Uses first two exposures consistently (no randomness in test)
     """
     def __init__(self, configs,
                  input_name='input_*_aligned.tif',
@@ -186,6 +241,7 @@ class U2NetTestDataset(Dataset):
         self.input_name = input_name
         self.input_exp_name = input_exp_name
         self.ref_hdr_name = ref_hdr_name
+        self.patch_size = configs.patch_size
         
         print('====> Finish preparing U2Net testing data!')
 
@@ -209,31 +265,31 @@ class U2NetTestDataset(Dataset):
         exp_path = os.path.join(scene_path, self.input_exp_name)
         in_exps = np.array(open(exp_path).read().split('\n')[:ns]).astype(np.float32)
         
-        # Load all LDR images
-        in_LDRs = np.zeros((h, w, c * ns), dtype=np.float32)
-        in_HDRs = np.zeros((h, w, c * ns), dtype=np.float32)
-
-        for i, image_path in enumerate(LDR_paths):
-            img = get_image(image_path, image_size=[h, w], is_crop=True)
-            in_LDRs[:, :, c * i:c * (i + 1)] = img
-            from utils.tools import LDR2HDR
-            in_HDRs[:, :, c * i:c * (i + 1)] = LDR2HDR(img, 2. ** in_exps[i])
+        # Use middle exposure as img1 (motion reference), first exposure as img2
+        idx1 = ns // 2  # Middle exposure
+        idx2 = 0 if idx1 != 0 else 1  # First exposure (or second if middle is first)
+        
+        # Load the two exposures
+        img1_ldr = get_image(LDR_paths[idx1], image_size=[h, w], is_crop=True)
+        img2_ldr = get_image(LDR_paths[idx2], image_size=[h, w], is_crop=True)
+        
+        img1_hdr = LDR2HDR(img1_ldr, 2. ** in_exps[idx1])
+        img2_hdr = LDR2HDR(img2_ldr, 2. ** in_exps[idx2])
 
         # Load reference HDR
         ref_HDR_path = os.path.join(scene_path, self.ref_hdr_name)
         ref_HDR = get_image(ref_HDR_path, image_size=[h, w], is_crop=True)
 
-        # Prepare U2Net inputs
-        img1_ldr = in_LDRs[:, :, 0:c]
-        img2_ldr = in_LDRs[:, :, c:c*2]
-        img1_hdr = in_HDRs[:, :, 0:c]
-        img2_hdr = in_HDRs[:, :, c:c*2]
+        # Create GLOBAL summaries (one for EACH exposure)
+        # Downsample full images to patch size
+        sum1_ldr = create_global_summary(img1_ldr, self.patch_size)
+        sum1_hdr = create_global_summary(img1_hdr, self.patch_size)
+        sum2_ldr = create_global_summary(img2_ldr, self.patch_size)
+        sum2_hdr = create_global_summary(img2_hdr, self.patch_size)
         
-        # Create summaries - concatenate LDR and HDR averages (6 channels total)
-        sum_ldr = np.mean(in_LDRs.reshape(h, w, ns, c), axis=2)
-        sum_hdr = np.mean(in_HDRs.reshape(h, w, ns, c), axis=2)
-        sum1 = np.concatenate([sum_ldr, sum_hdr], axis=2)
-        sum2 = np.concatenate([sum_ldr, sum_hdr], axis=2)
+        # Concatenate LDR and HDR for each (6 channels total)
+        sum1 = np.concatenate([sum1_ldr, sum1_hdr], axis=2)
+        sum2 = np.concatenate([sum2_ldr, sum2_hdr], axis=2)
 
         # Transpose to PyTorch format
         img1_ldr = np.einsum("ijk->kij", img1_ldr)

@@ -76,14 +76,6 @@ def gettime():
     return time_str
 
 
-def compute_summary_fast(ldr, tiles, coords, orig_shape, tile_h, tile_w):
-    """
-    COMPLETE: the summary is calculated by overlaying all the tiles of the image
-    let's say N tiles, and then merging them all so we end up with one tile representation
-    of the entire image
-    """
-
-
 def LDR2HDR(img, expo): # input/output 0~1
     return (((img+1)/2.)**GAMMA / expo) *2.-1
 
@@ -109,62 +101,11 @@ def transform_HDR(image, im_size=(256, 256)):
     return out*2. - 1.
 
 
-def tonemap(images, eps=1e-6):
-    """
-    Numerically stable tonemap function with proper handling of edge cases
-    Input/output range: [-1, 1]
-    """
-    # Clamp input to valid range to prevent extreme values
-    images = torch.clamp(images, -1.0, 1.0)
-    
-    # Transform from [-1, 1] to [0, 1] with epsilon for stability
-    normalized = (images + 1.0) / 2.0
-    normalized = torch.clamp(normalized, eps, 1.0)
-    
-    # Apply mu-law compression with numerical stability
-    compressed = torch.log(1.0 + MU * normalized + eps) / math.log(1.0 + MU)
-    
-    # Transform back to [-1, 1]
-    result = compressed * 2.0 - 1.0
-    
-    # Final safety check
-    result = torch.clamp(result, -1.0, 1.0)
-    
-    # Check for NaN/Inf and replace with zeros if found
-    if torch.isnan(result).any() or torch.isinf(result).any():
-        print("⚠️  Warning: NaN/Inf detected in tonemap output, replacing with safe values")
-        result = torch.where(torch.isnan(result) | torch.isinf(result), 
-                            torch.zeros_like(result), result)
-    
-    return result
+def tonemap(images):  # input/output 0~1
+    return torch.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
 
-
-def tonemap_np(images, eps=1e-6):
-    """
-    Numerically stable tonemap function for numpy arrays
-    Input/output range: [-1, 1]
-    """
-    # Clamp input to valid range
-    images = np.clip(images, -1.0, 1.0)
-    
-    # Transform from [-1, 1] to [0, 1] with epsilon
-    normalized = (images + 1.0) / 2.0
-    normalized = np.clip(normalized, eps, 1.0)
-    
-    # Apply mu-law compression
-    compressed = np.log(1.0 + MU * normalized + eps) / np.log(1.0 + MU)
-    
-    # Transform back to [-1, 1]
-    result = compressed * 2.0 - 1.0
-    
-    # Final clamp
-    result = np.clip(result, -1.0, 1.0)
-    
-    # Handle NaN/Inf
-    result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    return result
-
+def tonemap_np(images):  # input/output 0~1
+    return np.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
 
 def imread(path):
     if path[-4:] == '.hdr':
@@ -175,60 +116,19 @@ def imread(path):
 
 
 def radiance_writer(out_path, image):
-    """
-    Write HDR image in Radiance format (.hdr)
-    Handles NaN and infinite values gracefully
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    
-    # Check for and fix invalid values
-    if np.isnan(image).any():
-        print(f"Warning: NaN values detected in HDR image, replacing with 0")
-    
-    if np.isinf(image).any():
-        print(f"Warning: Infinite values detected in HDR image, clipping")
-    
-    # Ensure non-negative values (HDR should be non-negative)
-    image = np.maximum(image, 0.0)
-    
     with open(out_path, "wb") as f:
         f.write(b"#?RADIANCE\n# Made with Python & Numpy\nFORMAT=32-bit_rle_rgbe\n\n")
-        f.write(b"-Y %d +X %d\n" % (image.shape[0], image.shape[1]))
+        f.write(b"-Y %d +X %d\n" %(image.shape[0], image.shape[1]))
 
-        # Find brightest channel for each pixel
         brightest = np.maximum(np.maximum(image[..., 0], image[..., 1]), image[..., 2])
-        
-        # Add small epsilon to avoid division by zero
-        brightest = np.maximum(brightest, 1e-32)
-        
-        # Initialize arrays
         mantissa = np.zeros_like(brightest)
         exponent = np.zeros_like(brightest)
-        
-        # Compute mantissa and exponent
         np.frexp(brightest, mantissa, exponent)
-        
-        # Scale mantissa, avoiding division by zero
-        scaled_mantissa = np.divide(
-            mantissa * 255.0, 
-            brightest,
-            out=np.zeros_like(mantissa),
-            where=brightest > 1e-32
-        )
-        
-        # Initialize RGBE array
+        scaled_mantissa = mantissa * 255.0 / brightest
         rgbe = np.zeros((image.shape[0], image.shape[1], 4), dtype=np.uint8)
-        
-        # Safely compute RGB values with clipping
-        rgb_values = image[..., 0:3] * scaled_mantissa[..., None]
-        # Convert to uint8
-        rgbe[..., 0:3] = np.around(rgb_values).astype(np.uint8)
-        
-        # Compute exponent with offset, clipping to valid range
-        exp_values = np.clip(exponent + 128, 0, 255)
-        rgbe[..., 3] = np.around(exp_values).astype(np.uint8)
-        # Write to file
+        rgbe[..., 0:3] = np.around(image[..., 0:3] * scaled_mantissa[..., None])
+        rgbe[..., 3] = np.around(exponent + 128)
+
         rgbe.flatten().tofile(f)
 
 
@@ -313,55 +213,16 @@ def get_input(LDR_path, exp_path, ref_HDR_path):
     return in_LDRs, in_HDRs, in_exps, ref_HDR
 
 def dump_sample(sample_path, img):
-    """
-    Save HDR sample with validation.
-    Accepts:
-      - (B, C, H, W)
-      - (C, H, W)
-      - (H, W, C)
-    """
-
-    # ---- Normalize shape ----
-    if img.ndim == 4:          # (B, C, H, W)
-        img = img[0]
-    if img.ndim == 3 and img.shape[0] in (1, 3):  # (C, H, W)
-        img = img.transpose(1, 2, 0)              # -> (H, W, C)
-
-    assert img.ndim == 3, f"Invalid image shape: {img.shape}"
-
-    h, w, c = img.shape
-
-    # ---- Create directory ----
-    os.makedirs(sample_path, exist_ok=True)
-    file_path = os.path.join(sample_path, 'hdr.hdr')
-
-    # ---- Transform from [-1, 1] to [0, inf) ----
+    img = img[0]
+    h, w, _ = img.shape
+    if not os.path.exists(sample_path):
+        os.makedirs(sample_path)
+    file_path = sample_path + '/hdr.hdr'
     img = inverse_transform(img)
-
-    # ---- Validate ----
-    if np.isnan(img).any() or np.isinf(img).any():
-        print(f"Warning: Invalid values in output HDR image for {sample_path}")
-        print(f"  NaN count: {np.isnan(img).sum()}")
-        print(f"  Inf count: {np.isinf(img).sum()}")
-        print(f"  Min value: {np.nanmin(img):.6f}")
-        if not np.isinf(img).all():
-            print(f"  Max value: {np.nanmax(img[~np.isinf(img)])}")
-
-    # ---- Write HDR ----
+    img = np.einsum('ijk->jki', img)
     radiance_writer(file_path, img)
     
 def validate_hdr_output(output, name="output"):
-    """
-    Validate HDR output tensor for debugging
-    Returns True if valid, False otherwise
-    """
-    if torch.isnan(output).any():
-        nan_count = torch.isnan(output).sum().item()
-        print(f"❌ {name} contains {nan_count} NaN values")
-    
-    if torch.isinf(output).any():
-        inf_count = torch.isinf(output).sum().item()
-        print(f"❌ {name} contains {inf_count} infinite values")
 
     min_val = output.min().item()
     max_val = output.max().item()
@@ -371,32 +232,123 @@ def validate_hdr_output(output, name="output"):
     return True
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+def to_linear(x, eps=1e-4):
+    """Convert [-1, 1] to [eps, 1]"""
+    return torch.clamp((x + 1.0) * 0.5, eps, 1.0)
+
+
+# ------------------------------------------------------------
+# Log HDR loss (relative error)
+# ------------------------------------------------------------
+def hdr_log_l1(pred, gt):
+    p = to_linear(pred)
+    g = to_linear(gt)
+    return torch.mean(torch.abs(torch.log(p) - torch.log(g)))
+
+
+# ------------------------------------------------------------
+# FIX: Bilateral contrast loss (penalize both over and under)
+# ------------------------------------------------------------
+def contrast_loss(pred, gt):
+    pred_std = pred.flatten(1).std(dim=1)
+    gt_std = gt.flatten(1).std(dim=1)
+    
+    # Penalize both over-contrast and under-contrast
+    return torch.mean((pred_std - gt_std) ** 2)
+
+
+# ------------------------------------------------------------
+# FIX: Bilateral highlight loss
+# ------------------------------------------------------------
+def highlight_loss(pred, gt):
+    p99_pred = torch.quantile(pred.flatten(1), 0.99, dim=1)
+    p99_gt = torch.quantile(gt.flatten(1), 0.99, dim=1)
+    
+    # Penalize both over-exposure and under-exposure
+    return torch.mean((p99_pred - p99_gt) ** 2)
+
+
+# ------------------------------------------------------------
+# FIX: Strong mean matching loss
+# ------------------------------------------------------------
+def mean_matching_loss(pred, gt):
+    pred_mean = pred.flatten(1).mean(dim=1)
+    gt_mean = gt.flatten(1).mean(dim=1)
+    
+    # Strongly penalize mean mismatch
+    return torch.mean((pred_mean - gt_mean) ** 2)
+
+
+# ------------------------------------------------------------
+# Highlight-weighted absolute error
+# ------------------------------------------------------------
+def highlight_weighted_l1(pred, gt):
+    w = torch.clamp((gt + 1.0) * 0.5, 0.0, 1.0)
+    return torch.mean(w * torch.abs(pred - gt))
+
+
+# ------------------------------------------------------------
+# FIX: Add perceptual coherence loss
+# ------------------------------------------------------------
+def perceptual_gradient_loss(pred, gt):
+    """Match local gradients to preserve structure"""
+    # Sobel-like gradients
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    gt_dx = gt[:, :, :, 1:] - gt[:, :, :, :-1]
+    gt_dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
+    
+    loss_dx = torch.mean(torch.abs(pred_dx - gt_dx))
+    loss_dy = torch.mean(torch.abs(pred_dy - gt_dy))
+    
+    return loss_dx + loss_dy
+
+
 class HDRLoss(nn.Module):
-    """Numerically stable HDR loss with gradient clipping"""
+    """FIXED: Better balanced loss for statistics matching"""
     def __init__(self):
         super().__init__()
-    
-    def forward(self, out_img, ref_img):
-        # Ensure inputs are valid
-        if torch.isnan(out_img).any() or torch.isnan(ref_img).any():
-            print("⚠️  Warning: NaN detected in loss inputs")
-        
-        if torch.isinf(out_img).any() or torch.isinf(ref_img).any():
-            print("⚠️  Warning: Inf detected in loss inputs")
-            
-        # Compute squared difference
-        diff = out_img - ref_img
-        squared_diff = diff ** 2
-        
-        # Compute mean
-        loss = torch.mean(squared_diff)
-        
-        # Final safety check
-        if torch.isnan(loss) or torch.isinf(loss):
-            print("⚠️  Warning: Invalid loss computed, returning zero")
 
-        return loss
-    
+    def forward(self, pred, gt):
+        # FIX: Tighter clamp since we're using tanh now
+        pred = torch.clamp(pred, -2.0, 2.0)
+        
+        # Core losses
+        l_log = hdr_log_l1(pred, gt)
+        l_hi = highlight_weighted_l1(pred, gt)
+        l_con = contrast_loss(pred, gt)
+        l_peak = highlight_loss(pred, gt)
+        l_mean = mean_matching_loss(pred, gt)
+        l_grad = perceptual_gradient_loss(pred, gt)
+        
+        # FIX: Rebalanced weights to fix statistics
+        total = (
+            0.8 * l_log +    # HDR accuracy
+            0.4 * l_hi +     # Preserve bright structures
+            1.2 * l_con +    # STRONG contrast matching (was 0.7)
+            0.5 * l_peak +   # Highlight matching
+            2.0 * l_mean +   # VERY STRONG mean matching (was 0.2!)
+            0.3 * l_grad     # Structural coherence
+        )
+        print({
+            'hdr_log_l1': l_log.item(),
+            'highlight_weighted_l1': l_hi.item(),
+            'contrast_loss': l_con.item(),
+            'highlight_loss': l_peak.item(),
+            'meamean_matching_lossn': l_mean.item(),
+            'perceptual_gradient_loss': l_grad.item(),
+            'total': total.item()
+        })
+        
+        # Return individual losses for monitoring
+        return total
+
 
 from torch.optim.lr_scheduler import LambdaLR
 

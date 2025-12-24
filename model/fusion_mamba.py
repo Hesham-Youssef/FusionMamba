@@ -14,14 +14,14 @@ class SingleMambaBlock(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v6', 
                            if_devide_out=True, use_norm=True, input_h=H, input_w=W)
-        self.post_norm = nn.LayerNorm(dim)
+        # self.post_norm = nn.LayerNorm(dim)
         
     def forward(self, input):
         # input: (B, N, C)
         skip = input
         input = self.norm(input)
         output = self.block(input)
-        output = self.post_norm(output)
+        # output = self.post_norm(output)
         return output + skip
 
 
@@ -32,10 +32,10 @@ class CrossMambaBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.block = Mamba(dim, expand=1, d_state=16, bimamba_type='v7', 
                            if_devide_out=True, use_norm=True, input_h=H, input_w=W)
-        self.post_norm = nn.LayerNorm(dim)
+        # self.post_norm = nn.LayerNorm(dim)
         
         self.cross_weight_linear1 = nn.Linear(dim * 2, dim)
-        self.cross_weight_norm = nn.LayerNorm(dim)
+        # self.cross_weight_norm = nn.LayerNorm(dim)
         self.cross_weight_activation = nn.Sigmoid()
 
     def forward(self, input0, input1):
@@ -54,7 +54,7 @@ class CrossMambaBlock(nn.Module):
         combined = combined.clone().contiguous()  # Clone after cat to ensure alignment
         
         weight = self.cross_weight_linear1(combined)
-        weight = self.cross_weight_norm(weight).contiguous()
+        # weight = self.cross_weight_norm(weight).contiguous()
         weight = self.cross_weight_activation(weight)
         
         # CRITICAL: Clone and ensure contiguous before passing to Mamba
@@ -63,7 +63,7 @@ class CrossMambaBlock(nn.Module):
         
         # Apply Mamba block
         output = self.block(input0_for_mamba, extra_emb=input1_for_mamba)
-        output = self.post_norm(output).contiguous()
+        # output = self.post_norm(output).contiguous()
         output = output * weight + input0_norm * (1 - weight)
         
         return (output + skip).contiguous()
