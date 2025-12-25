@@ -7,13 +7,7 @@ from mamba_ssm.modules.mamba_simple import Mamba
 import math
 
 
-# =============================================================================
-# FIXED VERSION - Addresses checkerboard, statistics, and convergence issues
-# =============================================================================
-
-
 class DynamicRangeNorm(nn.Module):
-    """Lightweight normalization for pre-normalized inputs"""
     def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
@@ -21,11 +15,12 @@ class DynamicRangeNorm(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
         
     def forward(self, x):
-        return self.gamma * x + self.beta
-
+        mean = x.mean(dim=[2, 3], keepdim=True)
+        std = x.std(dim=[2, 3], keepdim=True) + self.eps
+        x_norm = (x - mean) / std
+        return self.gamma * x_norm + self.beta
 
 class ExposureAwareAttention(nn.Module):
-    """Conservative attention to prevent range violations"""
     def __init__(self, channels, reduction=8):
         super().__init__()
         
@@ -46,19 +41,16 @@ class ExposureAwareAttention(nn.Module):
         combined = torch.cat([avg_out, max_out], dim=1)
         attention = self.sigmoid(self.fc(combined))
         
-        # FIX: More conservative scaling [0.85, 1.15]
         return x * (attention * 0.3 + 0.85)
 
 
 class Up(nn.Module):
-    """FIXED: No more checkerboard artifacts!"""
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
         
-        # FIX: Use Upsample + Conv instead of ConvTranspose2d
         self.up = nn.Sequential(
             nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1),  # Regular conv after upsample
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
             DynamicRangeNorm(out_channels),
             nn.LeakyReLU(0.2, inplace=True)
         )
@@ -78,7 +70,7 @@ class Up(nn.Module):
         x = torch.cat([x1, x2], dim=1)
         x = self.conv(x)
         x = self.attention(x)
-        return x + x1 * 0.5  # Dampen residual
+        return x + x1 * 0.5
 
 
 class Down(nn.Module):
@@ -130,10 +122,9 @@ class Stage(nn.Module):
 
 
 class HDRHead(nn.Module):
-    """FIXED: Constrained output for [-1, 1] range"""
     def __init__(self, dim, out_channels):
         super().__init__()
-        num_groups = math.gcd(8, dim)  # largest divisor ≤ 8
+        num_groups = math.gcd(8, dim)
         self.conv = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
             nn.GroupNorm(num_groups, dim),
@@ -144,21 +135,15 @@ class HDRHead(nn.Module):
             nn.Conv2d(dim // 2, out_channels, 3, 1, 1)
         )
         
-        # FIX: Conservative initialization
-        nn.init.xavier_uniform_(self.conv[-1].weight, gain=0.5)
+        nn.init.zeros_(self.conv[-1].weight)
         nn.init.constant_(self.conv[-1].bias, 0.0)
-        
-        # FIX: Soft tanh constraint to keep output near [-1, 1]
-        self.output_scale = nn.Parameter(torch.tensor(1.2))
         
     def forward(self, x):
         output = self.conv(x)
-        # Soft constraint: allows slight excursion beyond [-1, 1] but pulls back
-        return torch.tanh(output) * self.output_scale
+        return output
 
 
 class SpeAttention(nn.Module):
-    """Conservative spectral attention"""
     def __init__(self, channels=32):
         super().__init__()
         
@@ -181,10 +166,7 @@ class SpeAttention(nn.Module):
         combined = torch.cat([avg_out, max_out], dim=-1).contiguous()
         
         attention = self.block(combined).unsqueeze(-1)
-        
-        # FIX: Very conservative range [0.95, 1.05]
         attention = attention * 0.1 + 0.95
-        
         return attention
 
 
@@ -230,19 +212,16 @@ class U2Net(nn.Module):
         self.stage3 = Stage(dim1, dim0, H//2, W//2, sample_mode='up')
         self.stage4 = FusionMamba(dim0, H, W, depth=3, final=True)
         
-        # FIX: Simpler, lighter feature refinement
         self.feature_refine = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
             DynamicRangeNorm(dim),
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # FIX: Use spectral attention for color
         self.spe_attn1 = SpeAttention(channels=dim)
         self.spe_attn2 = SpeAttention(channels=dim)
         
-        # FIX: Very small color blend
-        self.color_blend_alpha = nn.Parameter(torch.tensor(0.05))
+        self.color_blend_alpha = nn.Parameter(torch.tensor(0.3))
 
     def forward(self, img1, img2, sum1, sum2):
         img1 = self.raise_img1_dim(img1)
@@ -262,19 +241,15 @@ class U2Net(nn.Module):
         img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, img1_skip1, img2_skip1)
         img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
         
-        # Final fusion
         output = self.stage4(img1, img2, sum1, sum2)
 
-        # FIX: Single refinement pass
         output = output + self.feature_refine(output) * 0.2
 
-        # FIX: Minimal color preservation
         attn1 = self.spe_attn1(img1_orig)
         attn2 = self.spe_attn2(img2_orig)
         color_residual = (img1_orig * attn1 + img2_orig * attn2) * 0.5
         output = output + color_residual * self.color_blend_alpha
 
-        # Generate HDR output (now constrained by tanh)
         output = self.to_hdr(output)
 
         output = torch.clamp(output, -1.0, 1.0)
