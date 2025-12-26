@@ -76,18 +76,14 @@ def gettime():
     return time_str
 
 
-def LDR2HDR(img, expo): # input/output 0~1
-    return (((img+1)/2.)**GAMMA / expo) *2.-1
-
-
-def LDR2HDR_batch(imgs, expos): # input/output 0~1
-    return np.concatenate([LDR2HDR(imgs[:, :, 0:3], expos[0]),
-                           LDR2HDR(imgs[:, :, 3:6], expos[1]),
-                           LDR2HDR(imgs[:, :, 6:9], expos[2])], axis=2)
-
-
-def HDR2LDR(imgs, expo): # input/output 0~1
-    return (np.clip(((imgs+1)/2.*expo),0,1)**(1/GAMMA)) *2.-1
+def LDR2HDR(img, expo):
+    """Convert LDR to HDR with exposure correction"""
+    img_01 = np.clip((img + 1.0) / 2.0, 0.0, 1.0)
+    img_linear = np.power(img_01, GAMMA)
+    img_hdr = img_linear * expo  # MULTIPLY not divide!
+    img_compressed = np.log(1.0 + MU * img_hdr) / np.log(1.0 + MU)
+    img_normalized = img_compressed * 2.0 - 1.0
+    return img_normalized.astype(np.float32)
 
 
 def transform_LDR(image, im_size=(256, 256)):
@@ -101,10 +97,10 @@ def transform_HDR(image, im_size=(256, 256)):
     return out*2. - 1.
 
 
-def tonemap(images):  # input/output 0~1
+def tonemap(images):  # input/output -1~1
     return torch.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
 
-def tonemap_np(images):  # input/output 0~1
+def tonemap_np(images):  # input/output -1~1
     return np.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
 
 def imread(path):
@@ -131,8 +127,6 @@ def radiance_writer(out_path, image):
 
         rgbe.flatten().tofile(f)
 
-
-
 def store_patch(h1, h2, w1, w2, in_LDRs, in_exps, ref_HDR, ref_LDRs, ref_exps, save_path, save_id):
     res = {
         'in_LDR': in_LDRs,
@@ -155,7 +149,10 @@ def get_patch_from_file(pkl_path, pkl_id):
 def get_image(image_path, image_size=None, is_crop=False):
     if is_crop:
         assert (image_size is not None), "the crop size must be specified"
-    return transform(imread(image_path), image_size, is_crop)
+    
+    img = imread(image_path)
+    is_hdr = image_path.endswith('.hdr') or image_path.endswith('.exr')
+    return transform(img, image_size, is_crop, is_hdr=is_hdr)
 
 
 def merge(images, size):
@@ -176,19 +173,36 @@ def center_crop(x, image_size):
     return cv2.resize(x[max(0, j):min(h, j+crop_h), max(0, i):min(w, i+crop_w)], (crop_w, crop_h))
 
 
-def transform(image, image_size, is_crop):
+def transform(image, image_size, is_crop, is_hdr=False):
     if is_crop:
         out = center_crop(image, image_size)
     elif image_size is not None:
         out = cv2.resize(image, image_size)
     else:
         out = image
-    out = out*2. - 1
+    
+    if is_hdr:
+        # HDR: Apply log compression
+        out_compressed = np.log(1.0 + MU * out) / np.log(1.0 + MU)
+        out = out_compressed * 2.0 - 1.0
+    else:
+        # LDR: Linear mapping
+        out = out * 2.0 - 1.0
+    
     return out.astype(np.float32)
 
+def inverse_transform(images, MU=5000.0):
+    # compressed: torch.Tensor (on GPU or CPU)
+    compressed = (images + 1.0) / 2.0
+    hdr_radiance = (torch.pow(1.0 + MU, compressed) - 1.0) / MU
+    return hdr_radiance
 
-def inverse_transform(images):
-    return (images + 1) / 2
+def inverse_transform_np(images):
+    # Step 1: Undo the [-1,1] → [0,1] mapping
+    compressed = (images + 1.0) / 2.0
+    hdr_radiance = (np.power(1.0 + MU, compressed) - 1.0) / MU
+    return hdr_radiance
+
 
 
 # get input
@@ -218,7 +232,7 @@ def dump_sample(sample_path, img):
     if not os.path.exists(sample_path):
         os.makedirs(sample_path)
     file_path = sample_path + '/hdr.hdr'
-    img = inverse_transform(img)
+    img = inverse_transform_np(img)
     img = np.einsum('ijk->jki', img)
     radiance_writer(file_path, img)
     
@@ -232,124 +246,22 @@ def validate_hdr_output(output, name="output"):
     return True
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-
-
-def to_linear(x, eps=1e-4):
-    """Convert [-1, 1] to [eps, 1]"""
-    return torch.clamp((x + 1.0) * 0.5, eps, 1.0)
-
-
-# ------------------------------------------------------------
-# Log HDR loss (relative error)
-# ------------------------------------------------------------
-def hdr_log_l1(pred, gt):
-    p = to_linear(pred)
-    g = to_linear(gt)
-    return torch.mean(torch.abs(torch.log(p) - torch.log(g)))
-
-
-# ------------------------------------------------------------
-# FIX: Bilateral contrast loss (penalize both over and under)
-# ------------------------------------------------------------
-def contrast_loss(pred, gt):
-    pred_std = pred.flatten(1).std(dim=1)
-    gt_std = gt.flatten(1).std(dim=1)
-    
-    # Penalize both over-contrast and under-contrast
-    return torch.mean((pred_std - gt_std) ** 2)
-
-
-# ------------------------------------------------------------
-# FIX: Bilateral highlight loss
-# ------------------------------------------------------------
-def highlight_loss(pred, gt):
-    p99_pred = torch.quantile(pred.flatten(1), 0.99, dim=1)
-    p99_gt = torch.quantile(gt.flatten(1), 0.99, dim=1)
-    
-    # Penalize both over-exposure and under-exposure
-    return torch.mean((p99_pred - p99_gt) ** 2)
-
-
-# ------------------------------------------------------------
-# FIX: Strong mean matching loss
-# ------------------------------------------------------------
-def mean_matching_loss(pred, gt):
-    pred_mean = pred.flatten(1).mean(dim=1)
-    gt_mean = gt.flatten(1).mean(dim=1)
-    
-    # Strongly penalize mean mismatch
-    return torch.mean((pred_mean - gt_mean) ** 2)
-
-
-# ------------------------------------------------------------
-# Highlight-weighted absolute error
-# ------------------------------------------------------------
-def highlight_weighted_l1(pred, gt):
-    w = torch.clamp((gt + 1.0) * 0.5, 0.0, 1.0)
-    return torch.mean(w * torch.abs(pred - gt))
-
-
-# ------------------------------------------------------------
-# FIX: Add perceptual coherence loss
-# ------------------------------------------------------------
-def perceptual_gradient_loss(pred, gt):
-    """Match local gradients to preserve structure"""
-    # Sobel-like gradients
-    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-    gt_dx = gt[:, :, :, 1:] - gt[:, :, :, :-1]
-    gt_dy = gt[:, :, 1:, :] - gt[:, :, :-1, :]
-    
-    loss_dx = torch.mean(torch.abs(pred_dx - gt_dx))
-    loss_dy = torch.mean(torch.abs(pred_dy - gt_dy))
-    
-    return loss_dx + loss_dy
-
-
 class HDRLoss(nn.Module):
-    """FIXED: Better balanced loss for statistics matching"""
     def __init__(self):
         super().__init__()
-
-    def forward(self, pred, gt):
-        # FIX: Tighter clamp since we're using tanh now
-        pred = torch.clamp(pred, -2.0, 2.0)
+    
+    def forward(self, pred, target):
+        # Tonemap both prediction and target
+        pred_tone = tonemap(pred)
+        target_tone = tonemap(target)
         
-        # Core losses
-        l_log = hdr_log_l1(pred, gt)
-        l_hi = highlight_weighted_l1(pred, gt)
-        l_con = contrast_loss(pred, gt)
-        l_peak = highlight_loss(pred, gt)
-        l_mean = mean_matching_loss(pred, gt)
-        l_grad = perceptual_gradient_loss(pred, gt)
+        # MSE loss on tonemapped images (like DeepHDR)
+        loss = F.mse_loss(pred_tone, target_tone)
         
-        # FIX: Rebalanced weights to fix statistics
-        total = (
-            0.8 * l_log +    # HDR accuracy
-            0.4 * l_hi +     # Preserve bright structures
-            1.2 * l_con +    # STRONG contrast matching (was 0.7)
-            0.5 * l_peak +   # Highlight matching
-            2.0 * l_mean +   # VERY STRONG mean matching (was 0.2!)
-            0.3 * l_grad     # Structural coherence
-        )
-        print({
-            'hdr_log_l1': l_log.item(),
-            'highlight_weighted_l1': l_hi.item(),
-            'contrast_loss': l_con.item(),
-            'highlight_loss': l_peak.item(),
-            'meamean_matching_lossn': l_mean.item(),
-            'perceptual_gradient_loss': l_grad.item(),
-            'total': total.item()
-        })
-        
-        # Return individual losses for monitoring
-        return total
+        return loss
 
-
+    
+    
 from torch.optim.lr_scheduler import LambdaLR
 
 

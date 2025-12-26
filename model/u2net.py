@@ -1,89 +1,55 @@
 import torch
 import torch.nn as nn
-from torchinfo import summary
 import torch.nn.functional as F
 from model.fusion_mamba import FusionMamba
 from mamba_ssm.modules.mamba_simple import Mamba
-import math
 
 
-class DynamicRangeNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
-        
-    def forward(self, x):
-        mean = x.mean(dim=[2, 3], keepdim=True)
-        std = x.std(dim=[2, 3], keepdim=True) + self.eps
-        x_norm = (x - mean) / std
-        return self.gamma * x_norm + self.beta
-
-class ExposureAwareAttention(nn.Module):
+class SimpleAttention(nn.Module):
+    """Lightweight channel attention without over-compression"""
     def __init__(self, channels, reduction=8):
         super().__init__()
-        
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
         self.fc = nn.Sequential(
-            nn.Conv2d(channels * 2, channels // reduction, 1, bias=False),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
         )
         
-        self.sigmoid = nn.Sigmoid()
-        
     def forward(self, x):
-        avg_out = self.avg_pool(x)
-        max_out = self.max_pool(x)
-        combined = torch.cat([avg_out, max_out], dim=1)
-        attention = self.sigmoid(self.fc(combined))
-        
-        return x * (attention * 0.3 + 0.85)
+        attention = self.fc(self.avg_pool(x))
+        return x * attention * 0.5 + x * 0.5  # Gentle modulation
 
 
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
-        
         self.up = nn.Sequential(
             nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
             nn.Conv2d(in_channels, out_channels, 3, 1, 1),
-            DynamicRangeNorm(out_channels),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.GELU()
         )
-
         self.conv = nn.Sequential(
             nn.Conv2d(out_channels * 2, out_channels, 3, 1, 1),
-            DynamicRangeNorm(out_channels),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-            DynamicRangeNorm(out_channels)
+            nn.GELU()
         )
-        
-        self.attention = ExposureAwareAttention(out_channels)
         
     def forward(self, x1, x2):
         x1 = self.up(x1)
         x = torch.cat([x1, x2], dim=1)
         x = self.conv(x)
-        x = self.attention(x)
-        return x + x1 * 0.5
+        return x
 
 
 class Down(nn.Module):
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
-
         self.down = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, scale, scale, 0),
-            DynamicRangeNorm(out_channels),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.GELU(),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-            DynamicRangeNorm(out_channels),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.GELU()
         )
 
     def forward(self, x):
@@ -103,7 +69,7 @@ class Stage(nn.Module):
             self.sum_sample = Up(in_channels, out_channels, scale)
 
     def forward(self, img1, img2, img1_sum, img2_sum, img1_pre=None, img2_pre=None):
-        img1, img2 = self.fm(img1, img2, img1_sum, img2_sum)
+        img1, img2, img1_sum, img2_sum = self.fm(img1, img2, img1_sum, img2_sum)
 
         if img1_pre is None:
             img1_skip = img1
@@ -121,84 +87,19 @@ class Stage(nn.Module):
             return img1, img2, img1_sum, img2_sum
 
 
-class HDRHead(nn.Module):
-    def __init__(self, dim, out_channels):
-        super().__init__()
-        num_groups = math.gcd(8, dim)
-        self.conv = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.GroupNorm(num_groups, dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim, dim // 2, 3, 1, 1),
-            nn.GroupNorm(num_groups//2, dim // 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(dim // 2, out_channels, 3, 1, 1)
-        )
-        
-        nn.init.zeros_(self.conv[-1].weight)
-        nn.init.constant_(self.conv[-1].bias, 0.0)
-        
-    def forward(self, x):
-        output = self.conv(x)
-        return output
-
-
-class SpeAttention(nn.Module):
-    def __init__(self, channels=32):
-        super().__init__()
-        
-        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.max_pool = nn.AdaptiveMaxPool2d((1, 1))
-
-        self.block = nn.Sequential(
-            nn.Linear(2, channels),
-            nn.LayerNorm(channels),
-            Mamba(channels, expand=1, d_state=8, bimamba_type='v2', 
-                  if_devide_out=True, use_norm=True),
-            nn.Linear(channels, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, input):
-        input = input.contiguous()
-        avg_out = self.avg_pool(input).squeeze(-1)
-        max_out = self.max_pool(input).squeeze(-1)
-        combined = torch.cat([avg_out, max_out], dim=-1).contiguous()
-        
-        attention = self.block(combined).unsqueeze(-1)
-        attention = attention * 0.1 + 0.95
-        return attention
-
-
 class U2Net(nn.Module):
+    """Simplified U2Net focused on preserving HDR dynamic range"""
 
-    def __init__(self, dim, img1_dim, img2_dim, H=64, W=64):
+    def __init__(self, dim, img1_dim, img2_dim, H=64, W=64, debug=False):
         super().__init__()
+        self.debug = debug
+        self.register_buffer('step', torch.tensor(0))
 
-        # Input projection layers
-        self.raise_img1_dim = nn.Sequential(
-            nn.Conv2d(img1_dim, dim, 3, 1, 1),
-            DynamicRangeNorm(dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.raise_img2_dim = nn.Sequential(
-            nn.Conv2d(img2_dim, dim, 3, 1, 1),
-            DynamicRangeNorm(dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        self.raise_img1_sum_dim = nn.Sequential(
-            nn.Conv2d(img1_dim, dim, 3, 1, 1),
-            DynamicRangeNorm(dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.raise_img2_sum_dim = nn.Sequential(
-            nn.Conv2d(img2_dim, dim, 3, 1, 1),
-            DynamicRangeNorm(dim),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        self.to_hdr = HDRHead(dim, img2_dim // 2)
+        # Input projection - simple and direct
+        self.raise_img1_dim = nn.Conv2d(img1_dim, dim, 3, 1, 1)
+        self.raise_img2_dim = nn.Conv2d(img2_dim, dim, 3, 1, 1)
+        self.raise_img1_sum_dim = nn.Conv2d(img1_dim, dim, 3, 1, 1)
+        self.raise_img2_sum_dim = nn.Conv2d(img2_dim, dim, 3, 1, 1)
 
         # Dimensions for each stage
         dim0 = dim
@@ -210,28 +111,52 @@ class U2Net(nn.Module):
         self.stage1 = Stage(dim1, dim2, H//2, W//2, sample_mode='down')
         self.stage2 = Stage(dim2, dim1, H//4, W//4, sample_mode='up')
         self.stage3 = Stage(dim1, dim0, H//2, W//2, sample_mode='up')
-        self.stage4 = FusionMamba(dim0, H, W, depth=3, final=True)
+        self.stage4 = FusionMamba(dim0, H, W, depth=1, final=True)
         
-        self.feature_refine = nn.Sequential(
+        # Simple refinement
+        self.refine = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
-            DynamicRangeNorm(dim),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 3, 1, 1)
         )
         
-        self.spe_attn1 = SpeAttention(channels=dim)
-        self.spe_attn2 = SpeAttention(channels=dim)
+        # Attention for exposure blending
+        self.attention = SimpleAttention(dim)
         
-        self.color_blend_alpha = nn.Parameter(torch.tensor(0.3))
+        # Final output projection - CRITICAL: preserve HDR range
+        self.final_proj = nn.Sequential(
+            nn.Conv2d(dim, img2_dim, 3, 1, 1),
+            nn.Tanh()
+        )
+        
+        # Initialize final_proj to preserve signal
+        with torch.no_grad():
+            # Initialize to approximate identity mapping
+            nn.init.xavier_uniform_(self.final_proj[0].weight, gain=0.5)
+            if self.final_proj[0].bias is not None:
+                nn.init.zeros_(self.final_proj[0].bias)
+
+    def _print_range(self, name, tensor):
+        """Debug utility to monitor value ranges"""
+        # if self.debug and self.step % 100 == 0:
+        #     print(f"{name:25s}: [{tensor.min():7.3f}, {tensor.max():7.3f}] "
+        #           f"μ={tensor.mean():7.3f} σ={tensor.std():7.3f}")
 
     def forward(self, img1, img2, sum1, sum2):
+        if self.training:
+            self.step += 1
+        
+        # Project to feature space
         img1 = self.raise_img1_dim(img1)
         img2 = self.raise_img2_dim(img2)
         sum1 = self.raise_img1_sum_dim(sum1)
         sum2 = self.raise_img2_sum_dim(sum2)
 
-        # Store originals
         img1_orig = img1
         img2_orig = img2
+        
+        self._print_range("Input img1", img1_orig)
+        self._print_range("Input img2", img2_orig)
 
         # U-Net encoder
         img1, img2, sum1, sum2, img1_skip0, img2_skip0 = self.stage0(img1, img2, sum1, sum2)
@@ -241,17 +166,28 @@ class U2Net(nn.Module):
         img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, img1_skip1, img2_skip1)
         img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
         
+        # Final fusion
         output = self.stage4(img1, img2, sum1, sum2)
-
-        output = output + self.feature_refine(output) * 0.2
-
-        attn1 = self.spe_attn1(img1_orig)
-        attn2 = self.spe_attn2(img2_orig)
-        color_residual = (img1_orig * attn1 + img2_orig * attn2) * 0.5
-        output = output + color_residual * self.color_blend_alpha
-
-        output = self.to_hdr(output)
-
-        output = torch.clamp(output, -1.0, 1.0)
-
+        self._print_range("After stage4", output)
+        
+        # Add skip connection from input
+        output = output + img1_orig * 0.3
+        self._print_range("After skip", output)
+        
+        # Refinement
+        refined = self.refine(output)
+        output = output + refined * 0.5
+        self._print_range("After refine", output)
+        
+        # Gentle attention modulation
+        output = self.attention(output)
+        self._print_range("After attention", output)
+        
+        # Final projection to output space
+        output = self.final_proj(output)
+        self._print_range("After final_proj", output)
+        
+        # NO CLAMP - let HDR values be HDR!
+        # The loss function (tonemapping) will handle the range
+        # output = nn.Tanh(output)
         return output

@@ -18,11 +18,11 @@ class Configs:
         self.num_shots = 3  # Number of exposure images
         
         # Training parameters
-        self.batch_size = 8  # Batch size for training
+        self.batch_size = 32  # Batch size for training
         self.learning_rate = 2e-4  # Initial learning rate
         self.beta1 = 0.9  # Adam optimizer beta1
         self.beta2 = 0.999  # Adam optimizer beta2
-        self.epoch = 15  # Total number of training epochs
+        self.epoch = 4  # Total number of training epochs
         
         # Data processing
         self.patch_size = [64, 64]  # Size of training patches [height, width]

@@ -1,3 +1,14 @@
+"""
+Complete Fixed Dataset with HDR Summaries
+==========================================
+This version properly converts summaries to HDR format before caching.
+
+Key changes:
+1. Summaries are now HDR (not LDR) to match input format
+2. Cache stores HDR summaries
+3. All references updated from 'ldr' to 'hdr'
+"""
+
 import os
 import cv2
 from glob import glob
@@ -5,7 +16,7 @@ import numpy as np
 import pickle
 from pathlib import Path
 from torch.utils.data import Dataset
-from utils.tools import get_image, LDR2HDR_batch, LDR2HDR
+from utils.tools import get_image, LDR2HDR, tonemap
 
 
 def create_global_summary(full_image, target_size):
@@ -13,7 +24,7 @@ def create_global_summary(full_image, target_size):
     Compress full image into a summary of target_size.
     
     Args:
-        full_image: (H, W, C) numpy array
+        full_image: (H, W, C) numpy array (LDR or HDR)
         target_size: (h, w) tuple for output size
     
     Returns:
@@ -31,17 +42,17 @@ def create_global_summary(full_image, target_size):
 class SummaryCache:
     """
     Disk-based cache for global summaries.
-    Stores summaries as numpy files for fast loading.
+    FIXED: Now stores HDR summaries (not LDR)
     """
     def __init__(self, cache_dir):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-    def get_cache_path(self, scene_name, exp_idx, mode='ldr'):
+    def get_cache_path(self, scene_name, exp_idx, mode='hdr'):
         """Get the cache file path for a specific summary."""
         return self.cache_dir / f"{scene_name}_exp{exp_idx}_{mode}.npy"
     
-    def exists(self, scene_name, exp_idx, mode='ldr'):
+    def exists(self, scene_name, exp_idx, mode='hdr'):
         """Check if a cached summary exists."""
         return self.get_cache_path(scene_name, exp_idx, mode).exists()
     
@@ -50,7 +61,7 @@ class SummaryCache:
         cache_path = self.get_cache_path(scene_name, exp_idx, mode)
         np.save(cache_path, data.astype(np.float32))
     
-    def load(self, scene_name, exp_idx, mode='ldr'):
+    def load(self, scene_name, exp_idx, mode='hdr'):
         """Load a summary from disk."""
         cache_path = self.get_cache_path(scene_name, exp_idx, mode)
         return np.load(cache_path)
@@ -58,25 +69,27 @@ class SummaryCache:
     def build_scene_cache(self, scene_path, scene_name, input_paths, exposures, 
                           patch_size, num_shots):
         """
-        Build cache for all exposures in a scene.
-        This is called once during dataset initialization.
+        FIXED: Build HDR summaries instead of LDR summaries.
+        
+        This ensures summaries match the format of input patches used in training.
         """
-        print(f"Building cache for scene: {scene_name}")
+        print(f"Building HDR cache for scene: {scene_name}")
         
         for idx in range(num_shots):
             # Check if already cached
-            if self.exists(scene_name, idx, 'ldr') and self.exists(scene_name, idx, 'hdr'):
+            if self.exists(scene_name, idx, 'hdr'):
                 continue
             
-            # Load full image once
+            # Load full LDR image
             full_ldr = get_image(input_paths[idx])
+            
+            # CRITICAL FIX: Convert to HDR with exposure BEFORE downsampling
             full_hdr = LDR2HDR(full_ldr, exposures[idx])
             
-            # Create and cache summaries
-            sum_ldr = create_global_summary(full_ldr, patch_size)
+            # Downsample the HDR version
             sum_hdr = create_global_summary(full_hdr, patch_size)
             
-            self.save(scene_name, idx, 'ldr', sum_ldr)
+            # Save as HDR
             self.save(scene_name, idx, 'hdr', sum_hdr)
 
 
@@ -84,11 +97,11 @@ class U2NetDataset(Dataset):
     """
     Optimized Dataset for U2Net HDR reconstruction with disk caching.
     
-    Key optimizations:
-    - Global summaries cached to disk (computed once per scene)
-    - Only patches loaded on-demand during training
-    - Minimal memory footprint
-    - Fast random access
+    ALL FIXES APPLIED:
+    - Summaries now in HDR format (matches input patches)
+    - Ensures idx1 != idx2 for different exposures
+    - Validates exposure differences
+    - Proper log compression for HDR images
     """
     def __init__(self, configs,
                  input_name='input_*_aligned.tif',
@@ -97,7 +110,8 @@ class U2NetDataset(Dataset):
                  ref_exp_name='ref_exp.txt',
                  ref_hdr_name='ref_hdr_aligned.hdr',
                  cache_dir=None,
-                 rebuild_cache=False):
+                 rebuild_cache=False,
+                 debug=False):
         super().__init__()
         print('====> Start preparing U2Net training data.')
 
@@ -115,6 +129,7 @@ class U2NetDataset(Dataset):
         self.ref_exp_name = ref_exp_name
         self.ref_hdr_name = ref_hdr_name
         self.total_count = 0
+        self.debug = debug
         
         # Initialize cache
         if cache_dir is None:
@@ -143,8 +158,20 @@ class U2NetDataset(Dataset):
             
             # Load exposures
             in_exp_path = os.path.join(cur_scene_dir, self.input_exp_name)
-            in_exp = np.array(open(in_exp_path).read().split('\n')[:self.num_shots]).astype(np.float32)
-            in_exp = 2 ** in_exp
+            in_exp_raw = np.array(open(in_exp_path).read().split('\n')[:self.num_shots]).astype(np.float32)
+            in_exp = 2 ** in_exp_raw  # Convert to multipliers
+            
+            # VALIDATION: Check exposure diversity
+            if i == 0:  # Print for first scene
+                print(f"\n  First scene exposure check:")
+                print(f"    Raw values: {in_exp_raw}")
+                print(f"    Multipliers (2^exp): {in_exp}")
+                print(f"    Ratio (max/min): {in_exp.max() / in_exp.min():.4f}")
+                
+                if len(np.unique(in_exp_raw)) == 1:
+                    print(f"    ❌ WARNING: All exposures are IDENTICAL in {scene_dir}!")
+                elif in_exp.max() / in_exp.min() < 1.5:
+                    print(f"    ⚠️  WARNING: Small exposure variation in {scene_dir}")
             
             # Store metadata
             self.scene_metadata.append({
@@ -152,6 +179,7 @@ class U2NetDataset(Dataset):
                 'scene_name': scene_dir,
                 'input_paths': in_LDR_paths,
                 'exposures': in_exp,
+                'exposure_raw': in_exp_raw,
                 'height': h,
                 'width': w,
                 'h_count': h_count,
@@ -162,8 +190,8 @@ class U2NetDataset(Dataset):
             self.count.append(patch_count)
             self.total_count += patch_count
             
-            # Build cache for this scene if needed
-            if rebuild_cache or not self.cache.exists(scene_dir, 0, 'ldr'):
+            # FIXED: Check for HDR cache (not LDR)
+            if rebuild_cache or not self.cache.exists(scene_dir, 0, 'hdr'):
                 self.cache.build_scene_cache(
                     cur_scene_dir, scene_dir, in_LDR_paths, 
                     in_exp, self.patch_size, self.num_shots
@@ -190,6 +218,7 @@ class U2NetDataset(Dataset):
         cur_scene_dir = meta['scene_dir']
         in_LDR_paths = meta['input_paths']
         in_exp = meta['exposures']
+        in_exp_raw = meta['exposure_raw']
         h, w = meta['height'], meta['width']
         h_count, w_count = meta['h_count'], meta['w_count']
 
@@ -207,9 +236,7 @@ class U2NetDataset(Dataset):
         if w_right == w:
             w_left = w - self.patch_size[1]
 
-        # ================================================================
-        # EXPOSURE PAIR SELECTION
-        # ================================================================
+        # Select two DIFFERENT exposures
         idx1 = self.num_shots // 2  # Middle exposure (motion reference)
         
         if self.num_shots >= 2:
@@ -217,74 +244,72 @@ class U2NetDataset(Dataset):
             idx2 = np.random.choice(other_indices)
         else:
             idx2 = 0
-
-        # ================================================================
-        # Load ONLY patches (not full images!)
-        # ================================================================
-        img1_ldr_patch = get_image(in_LDR_paths[idx1])[h_up:h_down, w_left:w_right, :]
-        img2_ldr_patch = get_image(in_LDR_paths[idx2])[h_up:h_down, w_left:w_right, :]
+            print("⚠️  WARNING: Only 1 exposure available, idx1==idx2!")
         
-        img1_hdr_patch = LDR2HDR(img1_ldr_patch, in_exp[idx1])
-        img2_hdr_patch = LDR2HDR(img2_ldr_patch, in_exp[idx2])
+        # DEBUG: First time loading, print exposure info
+        if self.debug and index == 0:
+            print(f"\n=== FIRST BATCH DEBUG INFO ===")
+            print(f"Scene: {scene_name}")
+            print(f"Selected indices: idx1={idx1}, idx2={idx2}")
+            print(f"Raw exposures: exp1={in_exp_raw[idx1]:.4f}, exp2={in_exp_raw[idx2]:.4f}")
+            print(f"Exposure multipliers: exp1={in_exp[idx1]:.4f}, exp2={in_exp[idx2]:.4f}")
+            print(f"Ratio (exp1/exp2): {in_exp[idx1] / in_exp[idx2]:.4f}")
+            print(f"==============================\n")
 
-        # Load reference HDR patch
+        # Load LDR patches
+        img1_ldr = get_image(in_LDR_paths[idx1])[h_up:h_down, w_left:w_right, :]
+        img2_ldr = get_image(in_LDR_paths[idx2])[h_up:h_down, w_left:w_right, :]
+        
+        # Load reference HDR patch (will be auto-converted with log compression)
         ref_HDR = get_image(os.path.join(cur_scene_dir, self.ref_hdr_name))[h_up:h_down, w_left:w_right, :]
-
-        # ================================================================
-        # Load cached summaries (FAST - no full image loading!)
-        # ================================================================
-        sum1_ldr = self.cache.load(scene_name, idx1, 'ldr')
-        sum1_hdr = self.cache.load(scene_name, idx1, 'hdr')
-        sum2_ldr = self.cache.load(scene_name, idx2, 'ldr')
-        sum2_hdr = self.cache.load(scene_name, idx2, 'hdr')
-
-        # ================================================================
-        # Apply random augmentations
-        # ================================================================
+        
+        # FIXED: Load HDR summaries (not LDR)
+        sum1 = self.cache.load(scene_name, idx1, 'hdr')
+        sum2 = self.cache.load(scene_name, idx2, 'hdr')
+        
+        # Convert LDR patches to HDR with DIFFERENT exposures
+        img1_hdr = LDR2HDR(img1_ldr, in_exp[idx1])
+        img2_hdr = LDR2HDR(img2_ldr, in_exp[idx2])
+        
+        # DEBUG: Check if conversion worked
+        if self.debug and index == 0:
+            print(f"After LDR2HDR conversion:")
+            print(f"  img1_hdr range: [{img1_hdr.min():.4f}, {img1_hdr.max():.4f}]")
+            print(f"  img2_hdr range: [{img2_hdr.min():.4f}, {img2_hdr.max():.4f}]")
+            print(f"  sum1 range: [{sum1.min():.4f}, {sum1.max():.4f}]")
+            print(f"  sum2 range: [{sum2.min():.4f}, {sum2.max():.4f}]")
+            print(f"  ref_HDR range: [{ref_HDR.min():.4f}, {ref_HDR.max():.4f}]")
+            print(f"  ✓ All in HDR format now!")
+        
+        # Data augmentation
         distortions = np.random.uniform(0.0, 1.0, 2)
         
         # Horizontal flip
         if distortions[0] < 0.5:
-            img1_ldr_patch = np.flip(img1_ldr_patch, axis=1)
-            img2_ldr_patch = np.flip(img2_ldr_patch, axis=1)
-            img1_hdr_patch = np.flip(img1_hdr_patch, axis=1)
-            img2_hdr_patch = np.flip(img2_hdr_patch, axis=1)
+            img1_hdr = np.flip(img1_hdr, axis=1)
+            img2_hdr = np.flip(img2_hdr, axis=1)
+            sum1 = np.flip(sum1, axis=1)
+            sum2 = np.flip(sum2, axis=1)
             ref_HDR = np.flip(ref_HDR, axis=1)
-            sum1_ldr = np.flip(sum1_ldr, axis=1)
-            sum1_hdr = np.flip(sum1_hdr, axis=1)
-            sum2_ldr = np.flip(sum2_ldr, axis=1)
-            sum2_hdr = np.flip(sum2_hdr, axis=1)
 
         # Rotation
         k = int(distortions[1] * 4 + 0.5)
-        img1_ldr_patch = np.rot90(img1_ldr_patch, k)
-        img2_ldr_patch = np.rot90(img2_ldr_patch, k)
-        img1_hdr_patch = np.rot90(img1_hdr_patch, k)
-        img2_hdr_patch = np.rot90(img2_hdr_patch, k)
+        img1_hdr = np.rot90(img1_hdr, k)
+        img2_hdr = np.rot90(img2_hdr, k)
+        sum1 = np.rot90(sum1, k)
+        sum2 = np.rot90(sum2, k)
         ref_HDR = np.rot90(ref_HDR, k)
-        sum1_ldr = np.rot90(sum1_ldr, k)
-        sum1_hdr = np.rot90(sum1_hdr, k)
-        sum2_ldr = np.rot90(sum2_ldr, k)
-        sum2_hdr = np.rot90(sum2_hdr, k)
-        
-        # Concatenate summaries (6 channels each)
-        sum1 = np.concatenate([sum1_ldr, sum1_hdr], axis=2)
-        sum2 = np.concatenate([sum2_ldr, sum2_hdr], axis=2)
-        
+
         # Transpose to PyTorch format (C, H, W)
-        img1_ldr = np.einsum("ijk->kij", img1_ldr_patch)
-        img2_ldr = np.einsum("ijk->kij", img2_ldr_patch)
-        img1_hdr = np.einsum("ijk->kij", img1_hdr_patch)
-        img2_hdr = np.einsum("ijk->kij", img2_hdr_patch)
+        img1_hdr = np.einsum("ijk->kij", img1_hdr)
+        img2_hdr = np.einsum("ijk->kij", img2_hdr)
         sum1 = np.einsum("ijk->kij", sum1)
         sum2 = np.einsum("ijk->kij", sum2)
         ref_HDR = np.einsum("ijk->kij", ref_HDR)
 
-        return (img1_ldr.copy().astype(np.float32), 
-                img2_ldr.copy().astype(np.float32),
-                img1_hdr.copy().astype(np.float32),
+        return (img1_hdr.copy().astype(np.float32), 
                 img2_hdr.copy().astype(np.float32),
-                sum1.copy().astype(np.float32), 
+                sum1.copy().astype(np.float32),
                 sum2.copy().astype(np.float32),
                 ref_HDR.copy().astype(np.float32))
 
@@ -292,6 +317,7 @@ class U2NetDataset(Dataset):
 class U2NetTestDataset(Dataset):
     """
     Optimized test dataset with disk caching.
+    FIXED: Now uses HDR summaries
     """
     def __init__(self, configs,
                  input_name='input_*_aligned.tif',
@@ -327,11 +353,11 @@ class U2NetTestDataset(Dataset):
             # Load exposures
             exp_path = os.path.join(scene_path, self.input_exp_name)
             ns = len(LDR_paths)
-            in_exps = np.array(open(exp_path).read().split('\n')[:ns]).astype(np.float32)
-            in_exps = 2 ** in_exps
+            in_exps_raw = np.array(open(exp_path).read().split('\n')[:ns]).astype(np.float32)
+            in_exps = 2 ** in_exps_raw
             
-            # Build cache if needed
-            if rebuild_cache or not self.cache.exists(scene_dir, 0, 'ldr'):
+            # FIXED: Check for HDR cache
+            if rebuild_cache or not self.cache.exists(scene_dir, 0, 'hdr'):
                 self.cache.build_scene_cache(
                     scene_path, scene_dir, LDR_paths,
                     in_exps, self.patch_size, ns
@@ -358,36 +384,30 @@ class U2NetTestDataset(Dataset):
 
         # Load exposures
         exp_path = os.path.join(scene_path, self.input_exp_name)
-        in_exps = np.array(open(exp_path).read().split('\n')[:ns]).astype(np.float32)
+        in_exps_raw = np.array(open(exp_path).read().split('\n')[:ns]).astype(np.float32)
+        in_exps = 2 ** in_exps_raw
         
-        # Select exposure indices
+        # Select exposure indices (ensure they're different)
         idx1 = ns // 2  # Middle exposure
-        idx2 = 0 if idx1 != 0 else 1
+        idx2 = 0 if idx1 != 0 else 1  # Ensure idx2 != idx1
         
         # Load the two exposures
         img1_ldr = get_image(LDR_paths[idx1], image_size=[h, w], is_crop=True)
         img2_ldr = get_image(LDR_paths[idx2], image_size=[h, w], is_crop=True)
+ 
+        # Convert to HDR with correct exposures
+        img1_hdr = LDR2HDR(img1_ldr, in_exps[idx1])
+        img2_hdr = LDR2HDR(img2_ldr, in_exps[idx2])
         
-        img1_hdr = LDR2HDR(img1_ldr, 2. ** in_exps[idx1])
-        img2_hdr = LDR2HDR(img2_ldr, 2. ** in_exps[idx2])
-
         # Load reference HDR
         ref_HDR_path = os.path.join(scene_path, self.ref_hdr_name)
         ref_HDR = get_image(ref_HDR_path, image_size=[h, w], is_crop=True)
 
-        # Load cached summaries
-        sum1_ldr = self.cache.load(scene_dir, idx1, 'ldr')
-        sum1_hdr = self.cache.load(scene_dir, idx1, 'hdr')
-        sum2_ldr = self.cache.load(scene_dir, idx2, 'ldr')
-        sum2_hdr = self.cache.load(scene_dir, idx2, 'hdr')
+        # FIXED: Load HDR summaries
+        sum1 = self.cache.load(scene_dir, idx1, 'hdr')
+        sum2 = self.cache.load(scene_dir, idx2, 'hdr')
         
-        # Concatenate summaries
-        sum1 = np.concatenate([sum1_ldr, sum1_hdr], axis=2)
-        sum2 = np.concatenate([sum2_ldr, sum2_hdr], axis=2)
-
         # Transpose to PyTorch format
-        img1_ldr = np.einsum("ijk->kij", img1_ldr)
-        img2_ldr = np.einsum("ijk->kij", img2_ldr)
         img1_hdr = np.einsum("ijk->kij", img1_hdr)
         img2_hdr = np.einsum("ijk->kij", img2_hdr)
         sum1 = np.einsum("ijk->kij", sum1)
@@ -395,8 +415,6 @@ class U2NetTestDataset(Dataset):
         ref_HDR = np.einsum("ijk->kij", ref_HDR)
 
         return (sample_path,
-                img1_ldr.copy().astype(np.float32),
-                img2_ldr.copy().astype(np.float32),
                 img1_hdr.copy().astype(np.float32),
                 img2_hdr.copy().astype(np.float32),
                 sum1.copy().astype(np.float32),

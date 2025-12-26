@@ -12,6 +12,8 @@ import time
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import json
+from dataset_diag import *
+import gc
 
 
 def setup_seed(seed=0):
@@ -84,120 +86,100 @@ def make_blend_window(h, w, device, blend_type='gaussian'):
     return w2d[None, None]  # (1,1,H,W)
 
 
-def eval_one_epoch(epoch, save_outputs=True):
+
+def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=False):
     model.eval()
     mean_loss = 0.0
     count = 0
 
     patch_h, patch_w = configs.patch_size
-    # FIX: MAXIMUM overlap to eliminate grid artifacts (87.5% overlap)
-    stride = patch_h // 2  # Was patch_h // 4
-    
-    # FIX: Larger padding for better edge context
-    PAD = patch_h // 3  # Was patch_h // 4
-
-    PATCH_CHUNK = 120  # tune: 2–8 for 6GB GPU
+    stride = patch_h // 3  # 87.5% overlap
+    PATCH_CHUNK = 120
 
     pbar = tqdm(test_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Eval]')
 
-    for _, data in enumerate(pbar):
-        sample_path, img1_ldr, img2_ldr, img1_hdr, img2_hdr, sum1, sum2, ref_HDR = data
+    for batch_idx, data in enumerate(pbar):
+        sample_path, img1, img2, sum1, sum2, ref_HDR = data
         sample_path = sample_path[0]
 
-        img1_ldr = img1_ldr.to(device)
-        img2_ldr = img2_ldr.to(device)
-        img1_hdr = img1_hdr.to(device)
-        img2_hdr = img2_hdr.to(device)
+        img1 = img1.to(device)
+        img2 = img2.to(device)
         sum1 = sum1.to(device)
         sum2 = sum2.to(device)
         ref_HDR = ref_HDR.to(device)
 
-        _, _, H, W = img1_ldr.shape
+        _, _, H, W = img1.shape
 
-        # ============================================================
-        # TILED PATH WITH PROPER PADDING
-        # ============================================================
+        # Tiled inference for large images
         if H > patch_h or W > patch_w:
-
-            img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
-            img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
-
-            # FIX: Pad images with reflection for better edge handling
-            img1_padded = F.pad(img1, (PAD, PAD, PAD, PAD), mode='reflect')
-            img2_padded = F.pad(img2, (PAD, PAD, PAD, PAD), mode='reflect')
-            sum1_padded = F.pad(sum1, (PAD, PAD, PAD, PAD), mode='reflect')
-            sum2_padded = F.pad(sum2, (PAD, PAD, PAD, PAD), mode='reflect')
-
-            H_padded = H + 2 * PAD
-            W_padded = W + 2 * PAD
-
-            # ---- Generate patch coordinates with better coverage ----
-            h_starts = list(range(0, max(1, H_padded - patch_h + 1), stride))
-            w_starts = list(range(0, max(1, W_padded - patch_w + 1), stride))
-
-            # FIX: Ensure complete coverage by adding final patches if needed
-            if h_starts[-1] + patch_h < H_padded:
-                h_starts.append(H_padded - patch_h)
-            if w_starts[-1] + patch_w < W_padded:
-                w_starts.append(W_padded - patch_w)
+            # Generate patch positions
+            h_starts = []
+            h = 0
+            while h < H:
+                h_start = min(h, H - patch_h)
+                if not h_starts or h_starts[-1] != h_start:
+                    h_starts.append(h_start)
+                if h_start == H - patch_h:
+                    break
+                h += stride
+            
+            w_starts = []
+            w = 0
+            while w < W:
+                w_start = min(w, W - patch_w)
+                if not w_starts or w_starts[-1] != w_start:
+                    w_starts.append(w_start)
+                if w_start == W - patch_w:
+                    break
+                w += stride
 
             patch_coords = [(hs, ws) for hs in h_starts for ws in w_starts]
 
-            # Initialize output buffers (padded size)
-            result = torch.zeros((1, ref_HDR.shape[1], H_padded, W_padded), 
-                                device=device, dtype=ref_HDR.dtype)
-            weight_map = torch.zeros((1, 1, H_padded, W_padded), device=device)
+            # Result accumulation
+            result = torch.zeros((1, ref_HDR.shape[1], H, W), 
+                                device=device, dtype=torch.float32)
+            weight_map = torch.zeros((1, 1, H, W), device=device)
 
-            # FIX: Use Gaussian window for smoothest blending (eliminates grid artifacts)
-            blend = make_blend_window(patch_h, patch_w, device, blend_type='gaussian')
+            # Hann window for blending
+            def make_hann_window(h, w):
+                hann_h = torch.hann_window(h, device=device).view(-1, 1)
+                hann_w = torch.hann_window(w, device=device).view(1, -1)
+                window = hann_h * hann_w
+                return window.view(1, 1, h, w)
+            
+            blend = make_hann_window(patch_h, patch_w)
 
-            # ---- Chunked inference ----
+            # Chunked inference
             with torch.no_grad():
                 for start in range(0, len(patch_coords), PATCH_CHUNK):
                     batch = patch_coords[start:start + PATCH_CHUNK]
+                    batch_size = len(batch)
 
-                    b_img1, b_img2, b_sum1, b_sum2 = [], [], [], []
-
+                    b_img1, b_img2 = [], []
                     for hs, ws in batch:
                         he = hs + patch_h
                         we = ws + patch_w
-
-                        b_img1.append(img1_padded[:, :, hs:he, ws:we])
-                        b_img2.append(img2_padded[:, :, hs:he, ws:we])
-                        b_sum1.append(sum1_padded[:, :, hs:he, ws:we])
-                        b_sum2.append(sum2_padded[:, :, hs:he, ws:we])
+                        b_img1.append(img1[:, :, hs:he, ws:we])
+                        b_img2.append(img2[:, :, hs:he, ws:we])
 
                     b_img1 = torch.cat(b_img1, dim=0)
                     b_img2 = torch.cat(b_img2, dim=0)
-                    b_sum1 = torch.cat(b_sum1, dim=0)
-                    b_sum2 = torch.cat(b_sum2, dim=0)
+                    
+                    # Replicate global summaries
+                    b_sum1 = sum1.repeat(batch_size, 1, 1, 1)
+                    b_sum2 = sum2.repeat(batch_size, 1, 1, 1)
 
                     out = model(b_img1, b_img2, b_sum1, b_sum2)
-                    
-                    # Apply blending window
                     out = out * blend
 
-                    # Accumulate results
                     for i, (hs, ws) in enumerate(batch):
                         he = hs + patch_h
                         we = ws + patch_w
-
                         result[:, :, hs:he, ws:we] += out[i:i+1]
                         weight_map[:, :, hs:he, ws:we] += blend
 
-            # FIX: Normalize with minimum threshold
             result = result / torch.clamp(weight_map, min=1e-3)
-            
-            # FIX: Remove padding to get back to original size
-            result = result[:, :, PAD:PAD+H, PAD:PAD+W]
-            
-            # FIX: Optional post-smoothing to eliminate remaining artifacts
-            # Uncomment if you still see grid patterns
-            # result = self.smooth_boundaries(result, patch_h, stride)
 
-        # ============================================================
-        # NON-TILED PATH
-        # ============================================================
         else:
             img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
             img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
@@ -205,19 +187,74 @@ def eval_one_epoch(epoch, save_outputs=True):
             with torch.no_grad():
                 result = model(img1, img2, sum1, sum2)
 
-        # ============================================================
-        # LOSS + OUTPUT
-        # ============================================================
-        loss = criterion(tonemap(result), tonemap(ref_HDR))
-
+        # Compute loss
+        loss = criterion(result, ref_HDR)
+        
+        # Comprehensive diagnostics for first batch
+        # if batch_idx == 0:
+        comprehensive_diagnostics(
+            result, ref_HDR, 
+            img1,
+            img2,
+            sum1, sum2,
+            name=f"Eval - Epoch {epoch+1}, Scene {batch_idx}"
+        )
+        
+        # Save outputs and diagnostics
         if save_outputs:
+            save_diagnostic_images(
+                result, ref_HDR,
+                img1,
+                img2,
+                sample_path, batch_idx
+            )
+            
+            # Save HDR file (existing code)
+            from utils.tools import dump_sample
             dump_sample(sample_path, result.cpu().numpy())
+            
+            # Convert to numpy and remove batch dimension
+            result = result.detach().cpu().numpy()[0]  # (B, C, H, W) -> (C, H, W)
+            ref_HDR = ref_HDR.detach().cpu().numpy()[0]  # (B, C, H, W) -> (C, H, W)
+            
+            # Apply inverse transform
+            result = inverse_transform_np(result)
+            ref_HDR = inverse_transform_np(ref_HDR)
+            
+            # Transpose to (H, W, C)
+            result = np.einsum('ijk->jki', result)
+            ref_HDR = np.einsum('ijk->jki', ref_HDR)
+            
+            # Save tonemapped comparison
+            output_tonemapped = tonemap_np(result)
+            ref_tonemapped = tonemap_np(ref_HDR)
 
-        mean_loss += loss.item()
-        count += 1
-        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+            output_01 = (output_tonemapped + 1) / 2
+            ref_01 = (ref_tonemapped + 1) / 2
 
+            # Use np.clip, not torch.clamp (these are numpy arrays!)
+            output_01 = np.clip(output_01, 0, 1)
+            ref_01 = np.clip(ref_01, 0, 1)
+
+            output_8bit = (output_01 * 255).astype(np.uint8)
+            ref_8bit = (ref_01 * 255).astype(np.uint8)
+
+            # No need to check ndim now - already handled above
+            h, w = output_8bit.shape[:2]
+            comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
+            comparison[:, :w] = output_8bit
+            comparison[:, w:] = ref_8bit
+
+            cv2.putText(comparison, 'Output', (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(comparison, 'Reference', (w+10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            cv2.imwrite(os.path.join(sample_path, 'side_by_side.png'), 
+                        comparison[..., ::-1])
+            
     return mean_loss / max(count, 1)
+
 
 
 # Get configurations
@@ -251,7 +288,8 @@ train_dataloader = DataLoader(
     shuffle=True,
     num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
     pin_memory=True,
-    persistent_workers=True
+    persistent_workers=True,
+    prefetch_factor=4
 )
 logger.log(f"Training dataset loaded: {len(train_dataset)} patches")
 
@@ -260,15 +298,17 @@ test_dataset = U2NetTestDataset(configs=configs)
 test_dataloader = DataLoader(
     test_dataset, 
     batch_size=1, 
-    shuffle=False
+    shuffle=False,
+    num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
+    prefetch_factor=2
 )
 logger.log(f"Test dataset loaded: {len(test_dataset)} scenes")
 
 # Build U2Net model
 logger.log("Building U2Net model...")
 dim = configs.dim if hasattr(configs, 'dim') else 32
-img1_dim = configs.c_dim * 2
-img2_dim = configs.c_dim * 2
+img1_dim = configs.c_dim
+img2_dim = configs.c_dim
 H = configs.patch_size[0] if hasattr(configs, 'patch_size') else 64
 W = configs.patch_size[1] if hasattr(configs, 'patch_size') else 64
 
@@ -333,74 +373,105 @@ if configs.multigpu is True:
     logger.log(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
 
 
+
+def validate_data(data_tuple, name="data"):
+    """Check if data contains NaN or Inf"""
+    for i, tensor in enumerate(data_tuple):
+        if isinstance(tensor, torch.Tensor):
+            if torch.isnan(tensor).any():
+                print(f"❌ NaN found in {name}[{i}]")
+                return False
+            if torch.isinf(tensor).any():
+                print(f"❌ Inf found in {name}[{i}]")
+                return False
+            print(f"✓ {name}[{i}]: min={tensor.min():.4f}, max={tensor.max():.4f}, mean={tensor.mean():.4f}")
+    return True
+
+
+from torch.cuda.amp import autocast, GradScaler
+
+
 def train_one_epoch(epoch):
-    """Train for one epoch"""
     model.train()
     epoch_loss = 0.0
     
-    # Progress bar
+    scaler = GradScaler()
+    accumulation_steps = getattr(configs, 'accumulation_steps', 1)
+    
+    optimizer.zero_grad()
+    
     pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Train]')
     
     for idx, data in enumerate(pbar):
         # Unpack data
-        img1_ldr, img2_ldr, img1_hdr, img2_hdr, sum1, sum2, ref_HDR = data
+        img1, img2, sum1, sum2, ref_HDR = data
         
         # Move to device
-        img1_ldr = img1_ldr.to(device)
-        img2_ldr = img2_ldr.to(device)
-        img1_hdr = img1_hdr.to(device)
-        img2_hdr = img2_hdr.to(device)
-        sum1 = sum1.to(device)
-        sum2 = sum2.to(device)
-        ref_HDR = ref_HDR.to(device)
+        img1 = img1.to(device, non_blocking=True)
+        img2 = img2.to(device, non_blocking=True)
+        sum1 = sum1.to(device, non_blocking=True)
+        sum2 = sum2.to(device, non_blocking=True)
+        ref_HDR = ref_HDR.to(device, non_blocking=True)
         
-        # Prepare inputs
-        img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
-        img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
-        
-        # Forward pass
-        result = model(img1, img2, sum1, sum2)
-        
-        # diagnostic = SaturationDiagnostic(model)
-        # diagnosis = diagnostic.diagnose(img1, img2, sum1, sum2)
-
-        # Apply automatic fixes based on severity
-        # apply_quick_fixes(model, severity='medium')
-        
-        # Check for NaN/Inf in output (useful for debugging)
-        if torch.isnan(result).any() or torch.isinf(result).any():
-            logger.log(f"⚠️  Warning: Invalid values in model output at batch {idx+1}")
-            logger.log(f"   NaN count: {torch.isnan(result).sum().item()}")
-            logger.log(f"   Inf count: {torch.isinf(result).sum().item()}")
-            # Skip this batch
-            continue
-        
-        # Compute loss
-        loss = criterion(tonemap(result), tonemap(ref_HDR))
-        
-        # Check if loss is valid
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.log(f"⚠️  Warning: Invalid loss at batch {idx+1}, skipping")
-            continue
-        
+        # Forward pass with mixed precision
+        with autocast():
+            result = model(img1, img2, sum1, sum2)
+            loss = criterion(result, ref_HDR)
+            # print(f"ref_HDR: [{ref_HDR.min():7.3f}, {ref_HDR.max():7.3f}] "
+            #     f"μ={ref_HDR.mean():7.3f} σ={ref_HDR.std():7.3f}")
+            
+            if accumulation_steps > 1:
+                loss = loss / accumulation_steps
+                
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n❌ NaN/Inf in loss at batch {idx}: {loss.item()}")
+                optimizer.zero_grad()
+                continue
+            
         # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
         
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Update weights
+        if (idx + 1) % accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
         
-        optimizer.step()
+        epoch_loss += loss.item() * accumulation_steps
         
-        epoch_loss += loss.item()
-        
+        # Detailed diagnostics every 50 batches
+        if idx % 10 == 0:
+            with torch.no_grad():
+                comprehensive_diagnostics(
+                    result.float(), ref_HDR.float(), 
+                    img1.float(), img2.float(), 
+                    sum1.float(), sum2.float(),
+                    name=f"Epoch {epoch+1}, Batch {idx}"
+                )
+            
         # Update progress bar
-        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        pbar.set_postfix({
+            'loss': f'{loss.item() * accumulation_steps:.6f}',
+            'pred_range': f'[{result.min():.2f}, {result.max():.2f}]',
+            'tgt_range': f'[{ref_HDR.min():.2f}, {ref_HDR.max():.2f}]'
+        })
         
-        # Log to tensorboard every 100 batches
-        if (idx + 1) % 100 == 0:
+        # Tensorboard logging
+        if (idx + 1) % 10 == 0:
             global_step = epoch * len(train_dataloader) + idx
-            writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
+            writer.add_scalar('Train/BatchLoss', loss.item() * accumulation_steps, global_step)
+            writer.add_scalar('Train/PredMean', result.mean().item(), global_step)
+            writer.add_scalar('Train/PredStd', result.std().item(), global_step)
+            writer.add_scalar('Train/TargetMean', ref_HDR.mean().item(), global_step)
+    
+    # Handle remaining gradients
+    if (idx + 1) % accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
     
     avg_loss = epoch_loss / len(train_dataloader)
     return avg_loss
@@ -489,10 +560,19 @@ def train(start_epoch):
             epoch, 0, 0, optimizer, model, lr_scheduler, True
         )
         
+        torch.cuda.synchronize()  # ensure all kernels finished
+        torch.cuda.empty_cache() # release cached GPU memory
+        gc.collect()
+        
         # Evaluate
         eval_loss = 0
-        # eval_loss = eval_one_epoch(epoch)
-        # logger.log(f"Eval Loss: {eval_loss:.8f}")
+        with torch.no_grad():
+            eval_loss = eval_one_epoch(epoch)
+            logger.log(f"Eval Loss: {eval_loss:.8f}")
+        
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
         
         # Tensorboard logging
         writer.add_scalar('Eval/Loss', eval_loss, epoch)
@@ -530,6 +610,9 @@ def train(start_epoch):
         with open(stats_file, 'w') as f:
             json.dump(all_stats, f, indent=2)
     
+    # eval_loss = eval_one_epoch(epoch)
+    # logger.log(f"Eval Loss: {eval_loss:.8f}")
+        
     # Training complete
     total_time = time.time() - training_start_time
     logger.log("\n" + "="*80)
