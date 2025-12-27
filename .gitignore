@@ -3,3 +3,8 @@ debug
 weights
 __pycache__
 result_val
+summaries
+*results/
+checkpoints
+debug_output
+samples

@@ -85,24 +85,6 @@ def LDR2HDR(img, expo):
     img_normalized = img_compressed * 2.0 - 1.0
     return img_normalized.astype(np.float32)
 
-
-def transform_LDR(image, im_size=(256, 256)):
-    out = image.astype(np.float32)
-    out = cv2.resize(out, im_size)
-    return out/127.5 - 1.
-
-
-def transform_HDR(image, im_size=(256, 256)):
-    out = cv2.resize(image, im_size)
-    return out*2. - 1.
-
-
-def tonemap(images):  # input/output -1~1
-    return torch.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
-
-def tonemap_np(images):  # input/output -1~1
-    return np.log(1 + MU * (images + 1) / 2.) / np.log(1 + MU) * 2. - 1
-
 def imread(path):
     if path[-4:] == '.hdr':
         img = cv2.imread(path, -1)
@@ -244,22 +226,46 @@ def validate_hdr_output(output, name="output"):
     
     print(f"✓ {name} stats: min={min_val:.6f}, max={max_val:.6f}, mean={mean_val:.6f}")
     return True
-
-
 class HDRLoss(nn.Module):
-    def __init__(self):
+    """Better loss for HDR with gradient-friendly components"""
+    def __init__(self, 
+                 mse_weight=0.5,      # Reduced MSE (harsh on large errors)
+                 l1_weight=1.0,       # Keep L1 as primary
+                 cosine_weight=0.5):  # Add perceptual similarity
         super().__init__()
-    
+        self.mse_weight = mse_weight
+        self.l1_weight = l1_weight
+        self.cosine_weight = cosine_weight
+        
     def forward(self, pred, target):
-        # Tonemap both prediction and target
-        pred_tone = tonemap(pred)
-        target_tone = tonemap(target)
+        # Standard losses
+        mse_loss = F.mse_loss(pred, target)
+        l1_loss = F.l1_loss(pred, target)
         
-        # MSE loss on tonemapped images (like DeepHDR)
-        loss = F.mse_loss(pred_tone, target_tone)
+        # Cosine similarity loss (helps with overall structure)
+        pred_flat = pred.flatten(2)
+        target_flat = target.flatten(2)
+        cosine_sim = F.cosine_similarity(pred_flat, target_flat, dim=2).mean()
+        cosine_loss = 1 - cosine_sim
         
-        return loss
-
+        total_loss = (
+            self.mse_weight * mse_loss +
+            self.l1_weight * l1_loss +
+            self.cosine_weight * cosine_loss
+        )
+        
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print("WARNING: Loss is NaN/Inf!")
+            print(f"MSE: {mse_loss.item()}, L1: {l1_loss.item()}, Cosine: {cosine_loss.item()}")
+        
+        
+        print({
+            'mse': mse_loss.item(),
+            'l1': l1_loss.item(),
+            'cosine': cosine_loss.item(),
+            'total': total_loss.item()
+        })
+        return total_loss
     
     
 from torch.optim.lr_scheduler import LambdaLR

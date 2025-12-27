@@ -16,7 +16,7 @@ import numpy as np
 import pickle
 from pathlib import Path
 from torch.utils.data import Dataset
-from utils.tools import get_image, LDR2HDR, tonemap
+from utils.tools import get_image, LDR2HDR
 
 
 def create_global_summary(full_image, target_size):

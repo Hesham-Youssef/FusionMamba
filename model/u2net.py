@@ -6,7 +6,6 @@ from mamba_ssm.modules.mamba_simple import Mamba
 
 
 class SimpleAttention(nn.Module):
-    """Lightweight channel attention without over-compression"""
     def __init__(self, channels, reduction=8):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -126,8 +125,10 @@ class U2Net(nn.Module):
         # Final output projection - CRITICAL: preserve HDR range
         self.final_proj = nn.Sequential(
             nn.Conv2d(dim, img2_dim, 3, 1, 1),
-            nn.Tanh()
         )
+        
+        self.output_scale = nn.Parameter(torch.ones(1, img2_dim, 1, 1))
+        self.output_bias = nn.Parameter(torch.zeros(1, img2_dim, 1, 1))
         
         # Initialize final_proj to preserve signal
         with torch.no_grad():
@@ -176,7 +177,7 @@ class U2Net(nn.Module):
         
         # Refinement
         refined = self.refine(output)
-        output = output + refined * 0.5
+        output = output + refined * 0.1
         self._print_range("After refine", output)
         
         # Gentle attention modulation
@@ -186,8 +187,6 @@ class U2Net(nn.Module):
         # Final projection to output space
         output = self.final_proj(output)
         self._print_range("After final_proj", output)
-        
-        # NO CLAMP - let HDR values be HDR!
-        # The loss function (tonemapping) will handle the range
-        # output = nn.Tanh(output)
+        output = output * self.output_scale + self.output_bias
+
         return output

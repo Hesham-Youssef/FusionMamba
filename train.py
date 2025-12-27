@@ -204,52 +204,45 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
         if save_outputs:
             save_diagnostic_images(
                 result, ref_HDR,
-                img1,
-                img2,
+                img1, img2,
                 sample_path, batch_idx
             )
             
-            # Save HDR file (existing code)
+            # Save HDR file
             from utils.tools import dump_sample
             dump_sample(sample_path, result.cpu().numpy())
             
-            # Convert to numpy and remove batch dimension
-            result = result.detach().cpu().numpy()[0]  # (B, C, H, W) -> (C, H, W)
-            ref_HDR = ref_HDR.detach().cpu().numpy()[0]  # (B, C, H, W) -> (C, H, W)
+            # Convert to numpy
+            result = result.detach().cpu().numpy()[0]  # (C, H, W)
+            ref_HDR = ref_HDR.detach().cpu().numpy()[0]
             
-            # Apply inverse transform
-            result = inverse_transform_np(result)
-            ref_HDR = inverse_transform_np(ref_HDR)
+            # FIXED: Model output is ALREADY log-compressed (tonemapped)
+            # Just map [-1, 1] → [0, 1] for display
+            output_01 = (result + 1) / 2
+            ref_01 = (ref_HDR + 1) / 2
             
-            # Transpose to (H, W, C)
-            result = np.einsum('ijk->jki', result)
-            ref_HDR = np.einsum('ijk->jki', ref_HDR)
-            
-            # Save tonemapped comparison
-            output_tonemapped = tonemap_np(result)
-            ref_tonemapped = tonemap_np(ref_HDR)
-
-            output_01 = (output_tonemapped + 1) / 2
-            ref_01 = (ref_tonemapped + 1) / 2
-
-            # Use np.clip, not torch.clamp (these are numpy arrays!)
+            # Clip and convert to 8-bit
             output_01 = np.clip(output_01, 0, 1)
             ref_01 = np.clip(ref_01, 0, 1)
-
+            
+            # Transpose to (H, W, C)
+            output_01 = np.transpose(output_01, (1, 2, 0))
+            ref_01 = np.transpose(ref_01, (1, 2, 0))
+            
             output_8bit = (output_01 * 255).astype(np.uint8)
             ref_8bit = (ref_01 * 255).astype(np.uint8)
-
-            # No need to check ndim now - already handled above
+            
+            # Create side-by-side comparison
             h, w = output_8bit.shape[:2]
             comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
             comparison[:, :w] = output_8bit
             comparison[:, w:] = ref_8bit
-
+            
             cv2.putText(comparison, 'Output', (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             cv2.putText(comparison, 'Reference', (w+10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
+            
             cv2.imwrite(os.path.join(sample_path, 'side_by_side.png'), 
                         comparison[..., ::-1])
             
@@ -417,16 +410,10 @@ def train_one_epoch(epoch):
         with autocast():
             result = model(img1, img2, sum1, sum2)
             loss = criterion(result, ref_HDR)
-            # print(f"ref_HDR: [{ref_HDR.min():7.3f}, {ref_HDR.max():7.3f}] "
-            #     f"μ={ref_HDR.mean():7.3f} σ={ref_HDR.std():7.3f}")
-            
             if accumulation_steps > 1:
                 loss = loss / accumulation_steps
                 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n❌ NaN/Inf in loss at batch {idx}: {loss.item()}")
-                optimizer.zero_grad()
-                continue
+
             
         # Backward pass
         scaler.scale(loss).backward()
@@ -622,6 +609,11 @@ def train(start_epoch):
     logger.log("="*80)
     
     writer.close()
+    
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+    
 
 
 if __name__ == '__main__':
