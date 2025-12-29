@@ -1,96 +1,77 @@
 """
-U2Net Configuration Template
-
-This file contains the configuration parameters needed for U2Net training and testing.
-Copy this template and modify according to your dataset and requirements.
+U2Net Configuration - Optimized for HDR Reconstruction
 """
 
 class Configs:
     def __init__(self):
         # Data paths
-        self.data_path = './dataset'  # Root path to dataset
-        self.checkpoint_dir = './checkpoints/u2net'  # Where to save model checkpoints
-        self.sample_dir = './samples/u2net'  # Where to save test outputs
+        self.data_path = './dataset'
+        self.checkpoint_dir = './checkpoints/u2net'
+        self.sample_dir = './samples/u2net'
         
         # Model architecture parameters
-        self.dim = 32  # Base dimension for U2Net (channels in first layer)
-        self.c_dim = 3  # Color channels (RGB = 3)
-        self.num_shots = 3  # Number of exposure images
+        self.dim = 32  # Base dimension
+        self.c_dim = 3  # RGB channels
+        self.num_shots = 3
         
-        # Training parameters
-        self.batch_size = 25  # Batch size for training
-        self.learning_rate = 2e-4  # Initial learning rate
-        self.beta1 = 0.9  # Adam optimizer beta1
-        self.beta2 = 0.999  # Adam optimizer beta2
-        self.epoch = 10  # Total number of training epochs
+        # Training parameters - CRITICAL FIXES
+        self.batch_size = 64  # REDUCED from 110 for better gradient stability
+        self.learning_rate = 5e-5  # LOWERED from 2e-4 to prevent overshooting
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.epoch = 150
+        
+        # Gradient accumulation for larger effective batch size
+        self.accumulation_steps = 2  # Effective batch = 64 * 2 = 128
         
         # Data processing
-        self.patch_size = [64, 64]  # Size of training patches [height, width]
-        self.image_size = [64, 64]  # Size to resize images to [height, width]
-        self.patch_stride = 32  # Stride for patch extraction (overlap = patch_size - stride)
+        self.patch_size = [64, 64]
+        self.image_size = [64, 64]
+        self.patch_stride = 32
         
         # Hardware settings
-        self.multigpu = False  # Use multiple GPUs (DataParallel)
-        self.num_workers = 12  # Number of data loading workers
+        self.multigpu = False
+        self.num_workers = 12
         
         # Reproducibility
-        self.seed = 42  # Random seed for reproducibility
+        self.seed = 42
+        
+        # Loss function weights - NEW
+        self.loss_config = {
+            'type': 'improved',  # Use improved loss with SSIM + gradient
+            'l1_weight': 1.0,
+            'gradient_weight': 0.3,
+            'range_penalty_weight': 3.0,  # HIGH penalty for range violations
+            'ssim_weight': 0.0,  # Start with 0, can increase later if stable
+        }
+        
+        # Training optimizations
+        self.use_mixed_precision = True  # AMP for faster training
+        self.gradient_clip_norm = 1.0  # Gradient clipping
         
     def __str__(self):
         """Print configuration"""
         config_str = "U2Net Configuration:\n"
         config_str += "="*60 + "\n"
         for key, value in self.__dict__.items():
-            config_str += f"{key:20s}: {value}\n"
+            if isinstance(value, dict):
+                config_str += f"{key:20s}:\n"
+                for k, v in value.items():
+                    config_str += f"  {k:18s}: {v}\n"
+            else:
+                config_str += f"{key:20s}: {value}\n"
         config_str += "="*60
         return config_str
 
 
-# Example usage:
 if __name__ == '__main__':
     configs = Configs()
     print(configs)
     
-    # You can modify specific parameters like this:
-    # configs.batch_size = 16
-    # configs.learning_rate = 1e-4
-    # configs.dim = 64  # Use more channels for larger model
-    
-    # Important notes:
-    print("\nImportant Configuration Notes:")
+    print("\n🔧 Key Changes from Default:")
     print("-" * 60)
-    print("1. patch_size: Should match the H, W parameters used in U2Net model initialization")
-    print("   - Training uses patches of this size extracted from full images")
-    print("   - Must be divisible by 8 for proper encoder-decoder operation")
-    print("")
-    print("2. patch_stride: Controls overlap between patches")
-    print("   - Smaller stride = more overlap = more training samples")
-    print("   - Typical: stride = patch_size // 2 for 50% overlap")
-    print("")
-    print("3. dim: Base channel dimension for U2Net")
-    print("   - Larger dim = more capacity but slower training")
-    print("   - dim=32: ~5M parameters, dim=64: ~20M parameters")
-    print("")
-    print("4. batch_size: Depends on GPU memory")
-    print("   - 256x256 patches with dim=32: batch_size=8-16 on 12GB GPU")
-    print("   - Reduce if you get out-of-memory errors")
-    print("")
-    print("5. Dataset structure expected:")
-    print("   data_path/")
-    print("   ├── train/")
-    print("   │   ├── scene_001/")
-    print("   │   │   ├── input_1_aligned.tif")
-    print("   │   │   ├── input_2_aligned.tif")
-    print("   │   │   ├── input_3_aligned.tif")
-    print("   │   │   ├── input_exp.txt")
-    print("   │   │   └── ref_hdr_aligned.hdr")
-    print("   │   └── scene_002/...")
-    print("   └── test/")
-    print("       └── (same structure as train)")
-    print("")
-    print("6. U2Net expects inputs in this format:")
-    print("   - img1: concatenated [LDR_image1, HDR_image1] (6 channels)")
-    print("   - img2: concatenated [LDR_image2, HDR_image2] (6 channels)")
-    print("   - sum1: average of all LDR images (3 channels)")
-    print("   - sum2: average of all HDR images (3 channels)")
-    print("   - Output: HDR image (3 channels)")
+    print("1. ✅ Learning rate: 2e-4 → 5e-5 (prevents overshooting)")
+    print("2. ✅ Batch size: 110 → 64 (better gradient quality)")
+    print("3. ✅ Added accumulation_steps=2 (effective batch=128)")
+    print("4. ✅ Added loss_config with range penalty")
+    print("5. ✅ High range_penalty_weight=3.0 (enforces [-1,1] bounds)")

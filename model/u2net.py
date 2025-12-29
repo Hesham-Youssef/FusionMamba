@@ -5,35 +5,53 @@ from model.fusion_mamba import FusionMamba
 from mamba_ssm.modules.mamba_simple import Mamba
 
 
-class SimpleAttention(nn.Module):
-    def __init__(self, channels, reduction=8):
+class CrossScanAttention(nn.Module):
+    """Cross-attention between two image features (channel-wise)"""
+    def __init__(self, channels, mamba_channels=64):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False),
-            nn.Sigmoid()
-        )
+        self.pooling = nn.AdaptiveMaxPool2d((1, 1))
         
-    def forward(self, x):
-        attention = self.fc(self.avg_pool(x))
-        return x * attention * 0.5 + x * 0.5  # Gentle modulation
+        self.pre_linear = nn.Linear(1, mamba_channels)
+        self.norm = nn.LayerNorm(mamba_channels)
+        
+        self.mamba = Mamba(
+            mamba_channels, 
+            expand=1, 
+            d_state=8, 
+            bimamba_type='v3',
+            if_devide_out=False, 
+            use_norm=True
+        )
+        self.post_linear = nn.Linear(mamba_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, img1_features, img2_features):
+        img1_pooled = self.pooling(img1_features).squeeze(-1)
+        img2_pooled = self.pooling(img2_features).squeeze(-1)
+        
+        x1 = self.norm(self.pre_linear(img1_pooled))
+        x2 = self.norm(self.pre_linear(img2_pooled))
+        
+        x = self.mamba(x1, extra_emb=x2)
+        attention = self.post_linear(x)
+        attention = attention.unsqueeze(-1)
+        
+        return self.sigmoid(attention)
 
 
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels, scale):
         super().__init__()
         self.up = nn.Sequential(
-            nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1),
-            nn.GELU()
+            nn.Conv2d(in_channels, out_channels * (scale ** 2), 3, 1, 1),
+            nn.PixelShuffle(scale),
+            nn.ReLU(inplace=True),
         )
         self.conv = nn.Sequential(
             nn.Conv2d(out_channels * 2, out_channels, 3, 1, 1),
-            nn.GELU()
+            nn.ReLU(inplace=True),
         )
-        
+
     def forward(self, x1, x2):
         x1 = self.up(x1)
         x = torch.cat([x1, x2], dim=1)
@@ -46,9 +64,7 @@ class Down(nn.Module):
         super().__init__()
         self.down = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, scale, scale, 0),
-            nn.GELU(),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-            nn.GELU()
         )
 
     def forward(self, x):
@@ -57,9 +73,7 @@ class Down(nn.Module):
 
 class Stage(nn.Module):
     def __init__(self, in_channels, out_channels, H, W, scale=2, sample_mode='down'):
-        super().__init__()
-        self.fm = FusionMamba(in_channels, H, W)
-        
+        super().__init__()        
         if sample_mode == 'down':
             self.sample = Down(in_channels, out_channels, scale)
             self.sum_sample = Down(in_channels, out_channels, scale)
@@ -67,9 +81,7 @@ class Stage(nn.Module):
             self.sample = Up(in_channels, out_channels, scale)
             self.sum_sample = Up(in_channels, out_channels, scale)
 
-    def forward(self, img1, img2, img1_sum, img2_sum, img1_pre=None, img2_pre=None):
-        img1, img2, img1_sum, img2_sum = self.fm(img1, img2, img1_sum, img2_sum)
-
+    def forward(self, img1, img1_sum=None, img1_pre=None, img2=None, img2_sum=None, img2_pre=None):
         if img1_pre is None:
             img1_skip = img1
             img2_skip = img2
@@ -79,114 +91,173 @@ class Stage(nn.Module):
             img2_sum = self.sum_sample(img2_sum)
             return img1, img2, img1_sum, img2_sum, img1_skip, img2_skip
         else:
-            img1 = self.sample(img1, img1_pre)
-            img2 = self.sample(img2, img2_pre)
+            img1_up = self.sample(img1, img1_pre)
+            img2_up = self.sample(img2, img2_pre)
             img1_sum = self.sum_sample(img1_sum, img1_pre)
             img2_sum = self.sum_sample(img2_sum, img2_pre)
-            return img1, img2, img1_sum, img2_sum
+            
+            return img1_up, img2_up, img1_sum, img2_sum
 
 
 class U2Net(nn.Module):
-    """Simplified U2Net focused on preserving HDR dynamic range"""
-
     def __init__(self, dim, img1_dim, img2_dim, H=64, W=64, debug=False):
         super().__init__()
         self.debug = debug
         self.register_buffer('step', torch.tensor(0))
 
-        # Input projection - simple and direct
-        self.raise_img1_dim = nn.Conv2d(img1_dim, dim, 3, 1, 1)
-        self.raise_img2_dim = nn.Conv2d(img2_dim, dim, 3, 1, 1)
-        self.raise_img1_sum_dim = nn.Conv2d(img1_dim, dim, 3, 1, 1)
-        self.raise_img2_sum_dim = nn.Conv2d(img2_dim, dim, 3, 1, 1)
+        # Input projections - ADD BACK GroupNorm for stability
+        self.raise_img1_dim = nn.Sequential(
+            nn.Conv2d(img1_dim, dim, 3, 1, 1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(inplace=True),
+        )
+        self.raise_img2_dim = nn.Sequential(
+            nn.Conv2d(img2_dim, dim, 3, 1, 1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(inplace=True),
+        )
+        self.raise_img1_sum_dim = nn.Sequential(
+            nn.Conv2d(img1_dim, dim, 3, 1, 1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(inplace=True),
+        )
+        self.raise_img2_sum_dim = nn.Sequential(
+            nn.Conv2d(img2_dim, dim, 3, 1, 1),
+            nn.GroupNorm(8, dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.img1_dim = img1_dim
+        self.img2_dim = img2_dim
 
-        # Dimensions for each stage
+        # Dimensions
         dim0 = dim
         dim1 = int(dim0 * 2)
         dim2 = int(dim1 * 2)
 
-        # Main U-Net body
-        self.stage0 = Stage(dim0, dim1, H, W, sample_mode='down')
-        self.stage1 = Stage(dim1, dim2, H//2, W//2, sample_mode='down')
-        self.stage2 = Stage(dim2, dim1, H//4, W//4, sample_mode='up')
-        self.stage3 = Stage(dim1, dim0, H//2, W//2, sample_mode='up')
-        self.stage4 = FusionMamba(dim0, H, W, depth=1, final=True)
+        scale = 2
         
-        # Simple refinement
-        self.refine = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(dim, dim, 3, 1, 1)
-        )
+        # Encoder
+        self.stage0 = Stage(dim0, dim1, H, W, scale=scale, sample_mode='down')
+        self.stage1 = Stage(dim1, dim2, H//2, W//2, scale=scale, sample_mode='down')
         
-        # Attention for exposure blending
-        self.attention = SimpleAttention(dim)
-        
-        # Final output projection - CRITICAL: preserve HDR range
-        self.final_proj = nn.Sequential(
-            nn.Conv2d(dim, img2_dim, 3, 1, 1),
-        )
-        
-        self.output_scale = nn.Parameter(torch.ones(1, img2_dim, 1, 1))
-        self.output_bias = nn.Parameter(torch.zeros(1, img2_dim, 1, 1))
-        
-        # Initialize final_proj to preserve signal
-        with torch.no_grad():
-            # Initialize to approximate identity mapping
-            nn.init.xavier_uniform_(self.final_proj[0].weight, gain=0.5)
-            if self.final_proj[0].bias is not None:
-                nn.init.zeros_(self.final_proj[0].bias)
+        # Bottleneck fusion
+        self.fm = FusionMamba(dim2, H//4, W//4, depth=2, final=True)
 
-    def _print_range(self, name, tensor):
-        """Debug utility to monitor value ranges"""
-        # if self.debug and self.step % 100 == 0:
-        #     print(f"{name:25s}: [{tensor.min():7.3f}, {tensor.max():7.3f}] "
-        #           f"μ={tensor.mean():7.3f} σ={tensor.std():7.3f}")
+        # Decoder
+        self.stage2 = Stage(dim2, dim1, H//2, W//2, scale=scale, sample_mode='up')
+        self.stage3 = Stage(dim1, dim0, H, W, scale=scale, sample_mode='up')
+
+        # Feature encoding - ADD BACK GroupNorm
+        self.img1_encode = nn.Sequential(
+            nn.Conv2d(img1_dim, dim0, 3, 1, 1),
+            nn.GroupNorm(8, dim0),
+        )
+        self.img2_encode = nn.Sequential(
+            nn.Conv2d(img2_dim, dim0, 3, 1, 1),
+            nn.GroupNorm(8, dim0),
+        )
+        
+        # Cross-attention for motion/quality assessment
+        self.cross_attention = CrossScanAttention(dim0, mamba_channels=64)
+        
+        # Feature fusion with normalization
+        self.feature_fusion = nn.Sequential(
+            nn.Conv2d(dim0 * 3, dim0 * 2, 3, 1, 1),
+            nn.GroupNorm(8, dim0 * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim0 * 2, dim0, 3, 1, 1),
+            nn.GroupNorm(8, dim0),
+            nn.ReLU(inplace=True),
+        )
+        
+        # CONSTRAINED output projection with tanh
+        self.final_proj = nn.Sequential(
+            nn.Conv2d(dim0, dim0, 3, 1, 1),
+            nn.GroupNorm(8, dim0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim0, img1_dim, 3, 1, 1),
+            nn.Tanh()  # Natural [-1, 1] constraint
+        )
+        
+        # REMOVED learnable scaling - let tanh handle range
+        
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights for stable training"""
+        with torch.no_grad():
+            # Conservative initialization for final projection
+            for m in self.final_proj.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)  # Small gain for tanh
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+            
+            # Standard initialization for other layers
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d) and m not in self.final_proj.modules():
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(self, img1, img2, sum1, sum2):
         if self.training:
             self.step += 1
         
-        # Project to feature space
+        img1_orig = img1
+        img2_orig = img2
+        
+        # Encode inputs
         img1 = self.raise_img1_dim(img1)
         img2 = self.raise_img2_dim(img2)
         sum1 = self.raise_img1_sum_dim(sum1)
         sum2 = self.raise_img2_sum_dim(sum2)
 
-        img1_orig = img1
-        img2_orig = img2
+        # Encoder
+        img1, img2, sum1, sum2, img1_skip0, img2_skip0 = self.stage0(
+            img1, sum1, img2=img2, img2_sum=sum2
+        )
+        img1, img2, sum1, sum2, img1_skip1, img2_skip1 = self.stage1(
+            img1, sum1, img2=img2, img2_sum=sum2
+        )
         
-        self._print_range("Input img1", img1_orig)
-        self._print_range("Input img2", img2_orig)
-
-        # U-Net encoder
-        img1, img2, sum1, sum2, img1_skip0, img2_skip0 = self.stage0(img1, img2, sum1, sum2)
-        img1, img2, sum1, sum2, img1_skip1, img2_skip1 = self.stage1(img1, img2, sum1, sum2)
+        fused = self.fm(img1, img2, sum1, sum2)
         
-        # U-Net decoder
-        img1, img2, sum1, sum2 = self.stage2(img1, img2, sum1, sum2, img1_skip1, img2_skip1)
-        img1, img2, sum1, sum2 = self.stage3(img1, img2, sum1, sum2, img1_skip0, img2_skip0)
+        img1_dec, _, sum1, sum2 = self.stage2(
+            fused, sum1, img1_pre=img1_skip1, 
+            img2=fused, img2_sum=sum2, img2_pre=img1_skip1
+        )
         
-        # Final fusion
-        output = self.stage4(img1, img2, sum1, sum2)
-        self._print_range("After stage4", output)
+        img1_dec, _, sum1, sum2 = self.stage3(
+            img1_dec, sum1, img1_pre=img1_skip0, 
+            img2=img1_dec, img2_sum=sum2, img2_pre=img1_skip0
+        )
         
-        # Add skip connection from input
-        output = output + img1_orig * 0.3
-        self._print_range("After skip", output)
+        # Encode original features
+        img1_features = self.img1_encode(img1_orig)
+        img2_features = self.img2_encode(img2_orig)
         
-        # Refinement
-        refined = self.refine(output)
-        output = output + refined * 0.1
-        self._print_range("After refine", output)
+        # Cross-attention weight
+        cross_attn = self.cross_attention(img1_features, img2_features)
+            
+            
+        weighted_img1 = img1_features * cross_attn
+        weighted_img2 = img2_features * (1 - cross_attn)
         
-        # Gentle attention modulation
-        output = self.attention(output)
-        self._print_range("After attention", output)
+        # Fuse all information
+        all_features = torch.cat([
+            img1_dec,
+            weighted_img1,
+            weighted_img2
+        ], dim=1)
         
-        # Final projection to output space
-        output = self.final_proj(output)
-        self._print_range("After final_proj", output)
-        output = output * self.output_scale + self.output_bias
+        fused_features = self.feature_fusion(all_features)
+        
+        # Output with natural tanh constraint
+        output = self.final_proj(fused_features)
+        
+        # if torch.isnan(output).any():
+        #     print(f"⚠️  NaN in prediction gradients")
 
         return output

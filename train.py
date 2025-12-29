@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 import json
 from dataset_diag import *
 import gc
+from torch.cuda.amp import autocast, GradScaler
 
 
 def setup_seed(seed=0):
@@ -46,54 +47,34 @@ class Logger:
             f.write(log_message + '\n')
 
 
-
-
 def make_blend_window(h, w, device, blend_type='gaussian'):
-    """
-    Create blending window optimized to eliminate tiling artifacts
-    
-    Args:
-        blend_type: 'gaussian', 'cosine', 'linear', or 'hann'
-    """
+    """Create blending window for tiled inference"""
     if blend_type == 'gaussian':
-        # Gaussian - BEST for eliminating grid artifacts
         y = torch.linspace(-1, 1, h, device=device)
         x = torch.linspace(-1, 1, w, device=device)
         yy, xx = torch.meshgrid(y, x, indexing='ij')
         
-        # Gaussian from center with sigma tuned to minimize artifacts
         dist = torch.sqrt(xx**2 + yy**2)
-        sigma = 0.5  # Larger = more gradual falloff
+        sigma = 0.5
         weight = torch.exp(-(dist**2) / (2 * sigma**2))
-        
-        # Normalize to [0, 1] range
         weight = (weight - weight.min()) / (weight.max() - weight.min() + 1e-8)
         return weight[None, None]
         
-    elif blend_type == 'cosine':
-        # Cosine window - smoother than Hann
-        wy = (1 - torch.cos(torch.linspace(0, torch.pi, h, device=device))) / 2
-        wx = (1 - torch.cos(torch.linspace(0, torch.pi, w, device=device))) / 2
-    elif blend_type == 'linear':
-        # Linear ramps
-        wy = torch.linspace(0, 1, h, device=device)
-        wx = torch.linspace(0, 1, w, device=device)
-    else:  # hann
+    elif blend_type == 'hann':
         wy = torch.hann_window(h, periodic=False, device=device)
         wx = torch.hann_window(w, periodic=False, device=device)
-    
-    w2d = wy[:, None] * wx[None, :]
-    return w2d[None, None]  # (1,1,H,W)
+        w2d = wy[:, None] * wx[None, :]
+        return w2d[None, None]
 
 
-
-def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=False):
+def eval_one_epoch(epoch, save_outputs=True):
     model.eval()
-    mean_loss = 0.0
     count = 0
+    total_loss = 0
+    total_loss_dict = {}
 
     patch_h, patch_w = configs.patch_size
-    stride = patch_h // 3  # 87.5% overlap
+    stride = patch_h // 2
     PATCH_CHUNK = 120
 
     pbar = tqdm(test_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Eval]')
@@ -112,7 +93,6 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
 
         # Tiled inference for large images
         if H > patch_h or W > patch_w:
-            # Generate patch positions
             h_starts = []
             h = 0
             while h < H:
@@ -135,21 +115,12 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
 
             patch_coords = [(hs, ws) for hs in h_starts for ws in w_starts]
 
-            # Result accumulation
             result = torch.zeros((1, ref_HDR.shape[1], H, W), 
                                 device=device, dtype=torch.float32)
             weight_map = torch.zeros((1, 1, H, W), device=device)
 
-            # Hann window for blending
-            def make_hann_window(h, w):
-                hann_h = torch.hann_window(h, device=device).view(-1, 1)
-                hann_w = torch.hann_window(w, device=device).view(1, -1)
-                window = hann_h * hann_w
-                return window.view(1, 1, h, w)
-            
-            blend = make_hann_window(patch_h, patch_w)
+            blend = make_blend_window(patch_h, patch_w, device, blend_type='hann')
 
-            # Chunked inference
             with torch.no_grad():
                 for start in range(0, len(patch_coords), PATCH_CHUNK):
                     batch = patch_coords[start:start + PATCH_CHUNK]
@@ -164,8 +135,6 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
 
                     b_img1 = torch.cat(b_img1, dim=0)
                     b_img2 = torch.cat(b_img2, dim=0)
-                    
-                    # Replicate global summaries
                     b_sum1 = sum1.repeat(batch_size, 1, 1, 1)
                     b_sum2 = sum2.repeat(batch_size, 1, 1, 1)
 
@@ -179,60 +148,46 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
                         weight_map[:, :, hs:he, ws:we] += blend
 
             result = result / torch.clamp(weight_map, min=1e-3)
-
         else:
-            img1 = torch.cat([img1_ldr, img1_hdr], dim=1)
-            img2 = torch.cat([img2_ldr, img2_hdr], dim=1)
-
             with torch.no_grad():
                 result = model(img1, img2, sum1, sum2)
 
-        # Compute loss
-        loss = criterion(result, ref_HDR)
+        # Compute loss with components
+        loss, loss_dict = criterion(result, ref_HDR)
+        total_loss += loss.item()
         
-        # Comprehensive diagnostics for first batch
-        # if batch_idx == 0:
+        # Accumulate loss components
+        for key, value in loss_dict.items():
+            total_loss_dict[key] = total_loss_dict.get(key, 0.0) + value
+        
+        count += 1
+        
+        # Diagnostics
         comprehensive_diagnostics(
             result, ref_HDR, 
-            img1,
-            img2,
-            sum1, sum2,
+            img1, img2, sum1, sum2,
             name=f"Eval - Epoch {epoch+1}, Scene {batch_idx}"
         )
         
-        # Save outputs and diagnostics
+        # Save outputs
         if save_outputs:
-            save_diagnostic_images(
-                result, ref_HDR,
-                img1, img2,
-                sample_path, batch_idx
-            )
-            
-            # Save HDR file
+            save_diagnostic_images(result, ref_HDR, img1, img2, sample_path, batch_idx)
             from utils.tools import dump_sample
             dump_sample(sample_path, result.cpu().numpy())
             
-            # Convert to numpy
-            result = result.detach().cpu().numpy()[0]  # (C, H, W)
-            ref_HDR = ref_HDR.detach().cpu().numpy()[0]
+            # Save visualization
+            result_np = result.detach().cpu().numpy()[0]
+            ref_HDR_np = ref_HDR.detach().cpu().numpy()[0]
             
-            # FIXED: Model output is ALREADY log-compressed (tonemapped)
-            # Just map [-1, 1] → [0, 1] for display
-            output_01 = (result + 1) / 2
-            ref_01 = (ref_HDR + 1) / 2
+            output_01 = np.clip((result_np + 1) / 2, 0, 1)
+            ref_01 = np.clip((ref_HDR_np + 1) / 2, 0, 1)
             
-            # Clip and convert to 8-bit
-            output_01 = np.clip(output_01, 0, 1)
-            ref_01 = np.clip(ref_01, 0, 1)
-            
-            # Transpose to (H, W, C)
             output_01 = np.transpose(output_01, (1, 2, 0))
             ref_01 = np.transpose(ref_01, (1, 2, 0))
             
             output_8bit = (output_01 * 255).astype(np.uint8)
             ref_8bit = (ref_01 * 255).astype(np.uint8)
             
-            # Create side-by-side comparison
             h, w = output_8bit.shape[:2]
             comparison = np.zeros((h, w*2, 3), dtype=np.uint8)
             comparison[:, :w] = output_8bit
@@ -245,9 +200,114 @@ def eval_one_epoch(epoch, save_outputs=True, save_tiles=False, save_tile_core=Fa
             
             cv2.imwrite(os.path.join(sample_path, 'side_by_side.png'), 
                         comparison[..., ::-1])
-            
-    return mean_loss / max(count, 1)
+    
+    # Average loss components
+    avg_loss_dict = {key: value / count for key, value in total_loss_dict.items()}
+    return total_loss / max(count, 1), avg_loss_dict
 
+
+def train_one_epoch(epoch):
+    model.train()
+    epoch_loss = 0.0
+    epoch_loss_dict = {}
+    
+    scaler = GradScaler() if configs.use_mixed_precision else None
+    accumulation_steps = configs.accumulation_steps
+    
+    optimizer.zero_grad()
+    
+    pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Train]')
+    
+    for idx, data in enumerate(pbar):
+        img1, img2, sum1, sum2, ref_HDR = data
+        
+        img1 = img1.to(device, non_blocking=True)
+        img2 = img2.to(device, non_blocking=True)
+        sum1 = sum1.to(device, non_blocking=True)
+        sum2 = sum2.to(device, non_blocking=True)
+        ref_HDR = ref_HDR.to(device, non_blocking=True)
+        
+        # Forward pass
+        if configs.use_mixed_precision:
+            with autocast():
+                result = model(img1, img2, sum1, sum2)
+                loss, loss_dict = criterion(result, ref_HDR)
+                if accumulation_steps > 1:
+                    loss = loss / accumulation_steps
+        else:
+            result = model(img1, img2, sum1, sum2)
+            loss, loss_dict = criterion(result, ref_HDR)
+            if accumulation_steps > 1:
+                loss = loss / accumulation_steps
+        
+        # Accumulate loss components for logging
+        for key, value in loss_dict.items():
+            epoch_loss_dict[key] = epoch_loss_dict.get(key, 0.0) + value
+        
+        # Backward pass
+        if configs.use_mixed_precision:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
+        # Update weights
+        if (idx + 1) % accumulation_steps == 0:
+            if configs.use_mixed_precision:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=configs.gradient_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=configs.gradient_clip_norm)
+                optimizer.step()
+            
+            optimizer.zero_grad()
+        
+        epoch_loss += loss.item() * accumulation_steps
+        
+        # Detailed diagnostics every 10 batches
+        if idx % 10 == 0:
+            with torch.no_grad():
+                comprehensive_diagnostics(
+                    result.float(), ref_HDR.float(), 
+                    img1.float(), img2.float(), 
+                    sum1.float(), sum2.float(),
+                    name=f"Epoch {epoch+1}, Batch {idx}"
+                )
+        
+        # IMPROVED progress bar with loss components
+        pbar.set_postfix({
+            'loss': f'{loss.item() * accumulation_steps:.4f}',
+            'l1': f'{loss_dict["l1"]:.4f}',
+            'grad': f'{loss_dict["gradient"]:.4f}',
+            'range': f'{loss_dict["range_penalty"]:.4f}',
+            'pred': f'[{result.min():.2f},{result.max():.2f}]'
+        })
+        
+        # Tensorboard logging
+        if (idx + 1) % 10 == 0:
+            global_step = epoch * len(train_dataloader) + idx
+            writer.add_scalar('Train/BatchLoss', loss.item() * accumulation_steps, global_step)
+            writer.add_scalar('Train/L1Loss', loss_dict['l1'], global_step)
+            writer.add_scalar('Train/GradientLoss', loss_dict['gradient'], global_step)
+            writer.add_scalar('Train/RangePenalty', loss_dict['range_penalty'], global_step)
+            writer.add_scalar('Train/PredRange', result.max().item() - result.min().item(), global_step)
+    
+    # Handle remaining gradients
+    if (idx + 1) % accumulation_steps != 0:
+        if configs.use_mixed_precision:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=configs.gradient_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=configs.gradient_clip_norm)
+            optimizer.step()
+    
+    avg_loss = epoch_loss / len(train_dataloader)
+    avg_loss_dict = {key: value / len(train_dataloader) for key, value in epoch_loss_dict.items()}
+    
+    return avg_loss, avg_loss_dict
 
 
 # Get configurations
@@ -272,14 +332,14 @@ if hasattr(configs, 'seed'):
     setup_seed(configs.seed)
     logger.log(f"Random seed set to: {configs.seed}")
 
-# Load Data & build dataset
+# Load datasets
 logger.log("Loading training dataset...")
 train_dataset = U2NetDataset(configs=configs)
 train_dataloader = DataLoader(
     train_dataset, 
     batch_size=configs.batch_size, 
     shuffle=True,
-    num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
+    num_workers=configs.num_workers,
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=4
@@ -292,18 +352,18 @@ test_dataloader = DataLoader(
     test_dataset, 
     batch_size=1, 
     shuffle=False,
-    num_workers=configs.num_workers if hasattr(configs, 'num_workers') else 4,
-    prefetch_factor=2
+    num_workers=configs.num_workers,
+    prefetch_factor=4
 )
 logger.log(f"Test dataset loaded: {len(test_dataset)} scenes")
 
 # Build U2Net model
 logger.log("Building U2Net model...")
-dim = configs.dim if hasattr(configs, 'dim') else 32
+dim = configs.dim
 img1_dim = configs.c_dim
 img2_dim = configs.c_dim
-H = configs.patch_size[0] if hasattr(configs, 'patch_size') else 64
-W = configs.patch_size[1] if hasattr(configs, 'patch_size') else 64
+H = configs.patch_size[0]
+W = configs.patch_size[1]
 
 model = U2Net(dim=dim, img1_dim=img1_dim, img2_dim=img2_dim, H=H, W=W)
 
@@ -355,7 +415,7 @@ if os.path.isfile(checkpoint_file):
         best_loss = checkpoint['best_loss']
     logger.log(f"Loaded checkpoint (epoch {start_epoch}, best loss: {best_loss:.6f})")
 
-    eval_loss = eval_one_epoch(0)
+    eval_loss, _ = eval_one_epoch(0)
     logger.log(f"Eval Loss: {eval_loss:.8f}")
 else:
     logger.log("No checkpoint found, starting from scratch")
@@ -364,104 +424,6 @@ else:
 if configs.multigpu is True:
     model = torch.nn.DataParallel(model)
     logger.log(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-
-
-
-def validate_data(data_tuple, name="data"):
-    """Check if data contains NaN or Inf"""
-    for i, tensor in enumerate(data_tuple):
-        if isinstance(tensor, torch.Tensor):
-            if torch.isnan(tensor).any():
-                print(f"❌ NaN found in {name}[{i}]")
-                return False
-            if torch.isinf(tensor).any():
-                print(f"❌ Inf found in {name}[{i}]")
-                return False
-            print(f"✓ {name}[{i}]: min={tensor.min():.4f}, max={tensor.max():.4f}, mean={tensor.mean():.4f}")
-    return True
-
-
-from torch.cuda.amp import autocast, GradScaler
-
-
-def train_one_epoch(epoch):
-    model.train()
-    epoch_loss = 0.0
-    
-    scaler = GradScaler()
-    accumulation_steps = getattr(configs, 'accumulation_steps', 1)
-    
-    optimizer.zero_grad()
-    
-    pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Train]')
-    
-    for idx, data in enumerate(pbar):
-        # Unpack data
-        img1, img2, sum1, sum2, ref_HDR = data
-        
-        # Move to device
-        img1 = img1.to(device, non_blocking=True)
-        img2 = img2.to(device, non_blocking=True)
-        sum1 = sum1.to(device, non_blocking=True)
-        sum2 = sum2.to(device, non_blocking=True)
-        ref_HDR = ref_HDR.to(device, non_blocking=True)
-        
-        # Forward pass with mixed precision
-        with autocast():
-            result = model(img1, img2, sum1, sum2)
-            loss = criterion(result, ref_HDR)
-            if accumulation_steps > 1:
-                loss = loss / accumulation_steps
-                
-
-            
-        # Backward pass
-        scaler.scale(loss).backward()
-        
-        # Update weights
-        if (idx + 1) % accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-        
-        epoch_loss += loss.item() * accumulation_steps
-        
-        # Detailed diagnostics every 50 batches
-        if idx % 10 == 0:
-            with torch.no_grad():
-                comprehensive_diagnostics(
-                    result.float(), ref_HDR.float(), 
-                    img1.float(), img2.float(), 
-                    sum1.float(), sum2.float(),
-                    name=f"Epoch {epoch+1}, Batch {idx}"
-                )
-            
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{loss.item() * accumulation_steps:.6f}',
-            'pred_range': f'[{result.min():.2f}, {result.max():.2f}]',
-            'tgt_range': f'[{ref_HDR.min():.2f}, {ref_HDR.max():.2f}]'
-        })
-        
-        # Tensorboard logging
-        if (idx + 1) % 10 == 0:
-            global_step = epoch * len(train_dataloader) + idx
-            writer.add_scalar('Train/BatchLoss', loss.item() * accumulation_steps, global_step)
-            writer.add_scalar('Train/PredMean', result.mean().item(), global_step)
-            writer.add_scalar('Train/PredStd', result.std().item(), global_step)
-            writer.add_scalar('Train/TargetMean', ref_HDR.mean().item(), global_step)
-    
-    # Handle remaining gradients
-    if (idx + 1) % accumulation_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-    
-    avg_loss = epoch_loss / len(train_dataloader)
-    return avg_loss
 
 
 def save_checkpoint(epoch, loss, best_loss, optimizer, model, lr_scheduler, is_best=False):
@@ -506,6 +468,7 @@ def save_checkpoint(epoch, loss, best_loss, optimizer, model, lr_scheduler, is_b
     return checkpoint_path
 
 
+
 def train(start_epoch):
     """Main training loop"""
     global best_loss
@@ -514,9 +477,9 @@ def train(start_epoch):
     logger.log("Training Configuration:")
     logger.log(f"  Epochs: {configs.epoch}")
     logger.log(f"  Batch size: {configs.batch_size}")
+    logger.log(f"  Accumulation steps: {configs.accumulation_steps}")
+    logger.log(f"  Effective batch size: {configs.batch_size * configs.accumulation_steps}")
     logger.log(f"  Learning rate: {configs.learning_rate}")
-    logger.log(f"  Patch size: {configs.patch_size}")
-    logger.log(f"  Model dimension: {dim}")
     logger.log(f"  Device: {device}")
     logger.log("="*80 + "\n")
     
@@ -525,82 +488,62 @@ def train(start_epoch):
     for epoch in range(start_epoch, configs.epoch):
         epoch_start_time = time.time()
         
-        # Log epoch header
         logger.log(f"\n{'='*80}")
         logger.log(f"Epoch [{epoch + 1}/{configs.epoch}]")
         logger.log(f"Learning rate: {lr_scheduler.get_last_lr()[0]:.8f}")
         logger.log(f"{'='*80}")
         
         # Train
-        train_loss = train_one_epoch(epoch)
+        train_loss, train_loss_dict = train_one_epoch(epoch)
         logger.log(f"Train Loss: {train_loss:.8f}")
+        logger.log(f"  L1: {train_loss_dict['l1']:.6f}")
+        logger.log(f"  Gradient: {train_loss_dict['gradient']:.6f}")
+        logger.log(f"  Range Penalty: {train_loss_dict['range_penalty']:.6f}")
         
         # Tensorboard logging
         writer.add_scalar('Train/EpochLoss', train_loss, epoch)
+        writer.add_scalar('Train/L1Loss', train_loss_dict['l1'], epoch)
+        writer.add_scalar('Train/GradientLoss', train_loss_dict['gradient'], epoch)
+        writer.add_scalar('Train/RangePenalty', train_loss_dict['range_penalty'], epoch)
         writer.add_scalar('Train/LearningRate', lr_scheduler.get_last_lr()[0], epoch)
         
-        # Update learning rate
         lr_scheduler.step()
         
-        # Save checkpoint
-        checkpoint_path = save_checkpoint(
-            epoch, 0, 0, optimizer, model, lr_scheduler, True
-        )
-        
-        torch.cuda.synchronize()  # ensure all kernels finished
-        torch.cuda.empty_cache() # release cached GPU memory
-        gc.collect()
-        
-        # Evaluate
-        eval_loss = 0
-        with torch.no_grad():
-            eval_loss = eval_one_epoch(epoch)
-            logger.log(f"Eval Loss: {eval_loss:.8f}")
+        save_checkpoint(epoch, train_loss, best_loss, optimizer, model, lr_scheduler, False)
         
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
         
-        # Tensorboard logging
-        writer.add_scalar('Eval/Loss', eval_loss, epoch)
+        # Evaluate
+        eval_loss = 0
+        eval_loss_dict = {}
+        if epoch % 10 == 0:
+            with torch.no_grad():
+                eval_loss, eval_loss_dict = eval_one_epoch(epoch)
+                logger.log(f"Eval Loss: {eval_loss:.8f}")
+                logger.log(f"  L1: {eval_loss_dict['l1']:.6f}")
+                logger.log(f"  Gradient: {eval_loss_dict['gradient']:.6f}")
+                logger.log(f"  Range Penalty: {eval_loss_dict['range_penalty']:.6f}")
+                
+                writer.add_scalar('Eval/Loss', eval_loss, epoch)
+                writer.add_scalar('Eval/L1Loss', eval_loss_dict['l1'], epoch)
+                writer.add_scalar('Eval/GradientLoss', eval_loss_dict['gradient'], epoch)
+                writer.add_scalar('Eval/RangePenalty', eval_loss_dict['range_penalty'], epoch)
         
-        # Check if best model
-        is_best = eval_loss < best_loss
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        is_best = eval_loss < best_loss if eval_loss > 0 else False
         if is_best:
             logger.log(f"🎉 New best model! Loss improved from {best_loss:.8f} to {eval_loss:.8f}")
             best_loss = eval_loss
+            save_checkpoint(epoch, eval_loss, best_loss, optimizer, model, lr_scheduler, True)
         
-        
-        # Epoch summary
         epoch_time = time.time() - epoch_start_time
         logger.log(f"Epoch time: {epoch_time:.2f}s")
-        logger.log(f"Checkpoint saved to: {checkpoint_path}")
-        
-        # Save training statistics
-        stats = {
-            'epoch': epoch + 1,
-            'train_loss': train_loss,
-            'eval_loss': eval_loss,
-            'best_loss': best_loss,
-            'learning_rate': lr_scheduler.get_last_lr()[0],
-            'epoch_time': epoch_time
-        }
-        
-        stats_file = os.path.join(log_dir, 'training_stats.json')
-        if os.path.exists(stats_file):
-            with open(stats_file, 'r') as f:
-                all_stats = json.load(f)
-        else:
-            all_stats = []
-        
-        all_stats.append(stats)
-        with open(stats_file, 'w') as f:
-            json.dump(all_stats, f, indent=2)
     
-    # eval_loss = eval_one_epoch(epoch)
-    # logger.log(f"Eval Loss: {eval_loss:.8f}")
-        
-    # Training complete
     total_time = time.time() - training_start_time
     logger.log("\n" + "="*80)
     logger.log("Training Completed!")
@@ -609,11 +552,9 @@ def train(start_epoch):
     logger.log("="*80)
     
     writer.close()
-    
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
-    
 
 
 if __name__ == '__main__':
