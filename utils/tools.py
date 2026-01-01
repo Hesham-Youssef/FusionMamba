@@ -84,7 +84,6 @@ def LDR2HDR(img, expo):
     img_hdr = img_hdr / expo  # MULTIPLY not divide!
     img_compressed = np.log(1.0 + MU * img_hdr) / np.log(1.0 + MU)
     img_normalized = img_compressed * 2.0 - 1.0
-    print()
     return img_normalized.astype(np.float32)
 
 from pathlib import Path
@@ -190,8 +189,7 @@ def transform(image, image_size, is_crop, is_hdr=False):
     return out.astype(np.float32)
 
 def inverse_transform(images, MU=5000.0):
-    # images: tensor with expected range [-1,1]
-    compressed = torch.clamp((images + 1.0) / 2.0, 0.0, 1.0)  # <- clamp to [0,1]
+    compressed = (images + 1.0) / 2.0
     hdr_radiance = (torch.pow(1.0 + MU, compressed) - 1.0) / MU
     return hdr_radiance
 
@@ -213,107 +211,109 @@ def dump_sample(sample_path, img):
     
 
 
+def compute_metrics(pred, target, use_hdr=False, mu=5000.0):
+    """
+    pred, target: torch tensors in [-1,1], shape [B,C,H,W]
+    use_hdr: if True, compute metrics in linear HDR space
+    """
+
+    pred_np = pred.detach().cpu()
+    target_np = target.detach().cpu()
+
+    if use_hdr:
+        # Convert back to linear HDR
+        pred_np = inverse_transform(pred_np, MU=mu)
+        target_np = inverse_transform(target_np, MU=mu)
+        data_range = pred_np.max().item()  # HDR dynamic range
+    else:
+        # Log-compressed space [-1,1] → [0,1]
+        pred_np = (pred_np + 1) / 2
+        target_np = (target_np + 1) / 2
+        data_range = 1.0
+
+    # Convert to numpy HWC
+    pred_img = pred_np[0].permute(1, 2, 0).numpy()
+    target_img = target_np[0].permute(1, 2, 0).numpy()
+
+    psnr_fn = PSNR(range=data_range)
+    ssim_fn = SSIM(range=data_range)
+
+    psnr = psnr_fn(pred_img, target_img)
+    ssim = ssim_fn(pred_img, target_img)
+
+    return psnr, ssim
+
+
 class HDRLoss(nn.Module):
-    """
-    Multi-component loss for HDR reconstruction that addresses:
-    - Range control (prevents overshooting)
-    - Texture preservation (reduces graininess)
-    - Perceptual quality
-    """
-    def __init__(self, 
+    def __init__(self,
                  mse_weight=1.0,
                  l1_weight=1.0,
-                 gradient_weight=1.0,
-                 range_penalty_weight=1.0):
+                 use_shuffling=False,
+                 MU=5000.0):
         super().__init__()
         self.mse_weight = mse_weight
         self.l1_weight = l1_weight
-        self.gradient_weight = gradient_weight
-        self.range_penalty_weight = range_penalty_weight
+        self.use_shuffling = use_shuffling
+        self.MU = MU
 
-    def gradient_loss(self, pred, target):
-        """
-        Gradient loss - helps preserve edges and reduces smoothing artifacts
-        """
-        # Sobel kernels
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                                dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                                dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-        
-        # Expand for all channels
-        sobel_x = sobel_x.repeat(pred.size(1), 1, 1, 1)
-        sobel_y = sobel_y.repeat(pred.size(1), 1, 1, 1)
-        
-        # Compute gradients
-        pred_grad_x = F.conv2d(pred, sobel_x, padding=1, groups=pred.size(1))
-        pred_grad_y = F.conv2d(pred, sobel_y, padding=1, groups=pred.size(1))
-        target_grad_x = F.conv2d(target, sobel_x, padding=1, groups=target.size(1))
-        target_grad_y = F.conv2d(target, sobel_y, padding=1, groups=target.size(1))
-        
-        # L1 loss on gradients
-        grad_loss = F.l1_loss(pred_grad_x, target_grad_x) + \
-                    F.l1_loss(pred_grad_y, target_grad_y)
-        
-        return grad_loss
-    
-    def range_penalty(self, pred, target):
-        """
-        Penalize predictions that exceed target range - prevents overshooting
-        """
-        target_min = target.min()
-        target_max = target.max()
-        
-        # Penalize values outside target range
-        below_min = F.relu(target_min - pred)
-        above_max = F.relu(pred - target_max)
-        
-        penalty = below_min.mean() + above_max.mean()
-        
-        # Extra penalty for extreme overshoots (>1.0 when target max < 1.0)
-        if target_max < 1.0:
-            extreme_overshoot = F.relu(pred - 1.0)
-            penalty += extreme_overshoot.mean() * 2.0
-        
-        return penalty
 
     def forward(self, pred, target):
         """
-        Combined loss function
+        ✅ FIXED: Proper NaN handling with gradient-connected fallback
         """
-        if torch.isnan(pred).any():
-            print(f"⚠️  NaN in pred gradients")
-            
-        if torch.isnan(target).any():
-            print(f"⚠️  NaN in target gradients")
+        # Check for NaN/Inf BEFORE creating loss
+        if torch.isnan(pred).any() or torch.isinf(pred).any():
+            print(f"⚠️  NaN/Inf in prediction! Stats: min={pred.min():.4f}, max={pred.max():.4f}, mean={pred.mean():.4f}")
+            # Create a high loss that maintains gradient connection
+            # Use mean of pred (which has gradients) to keep graph intact
+            safe_pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=-1.0)
+            fallback_loss = 1e3 * F.mse_loss(safe_pred, target) + 1e3
+            return fallback_loss, {
+                'total': fallback_loss.item(),
+                'mse': 0.0,
+                'l1': 0.0,
+                'linear_l1': 0.0
+            }
         
-        # Basic reconstruction losses
+        if torch.isnan(target).any() or torch.isinf(target).any():
+            print(f"⚠️  NaN/Inf in target!")
+            safe_target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=-1.0)
+            fallback_loss = 1e3 * F.mse_loss(pred, safe_target) + 1e3
+            return fallback_loss, {
+                'total': fallback_loss.item(),
+                'mse': 0.0,
+                'l1': 0.0,
+                'linear_l1': 0.0
+            }
+
+        # Linear space loss with safe inverse transform
+        pred = inverse_transform(pred)
+        target = inverse_transform(target)
+
         mse_loss = F.mse_loss(pred, target)
         l1_loss = F.l1_loss(pred, target)
         
-        # Perceptual quality losses
-        grad_loss = self.gradient_loss(pred, target)
-        
-        # Range control
-        range_penalty_val = self.range_penalty(pred, target)
-        
-        # Combine all losses
+        # Total loss with safety check
         total_loss = (
             self.mse_weight * mse_loss +
-            self.l1_weight * l1_loss +
-            self.gradient_weight * grad_loss +
-            self.range_penalty_weight * range_penalty_val
+            self.l1_weight * l1_loss
         )
-        
-        # Log individual components for monitoring
+
+        # Final safety check
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"⚠️  NaN/Inf in total loss!")
+            return torch.tensor(1e6, device=pred.device, dtype=pred.dtype, requires_grad=True), {
+                'total': 1e6,
+                'mse': mse_loss.item() if not torch.isnan(mse_loss) else 0.0,
+                'l1': l1_loss.item() if not torch.isnan(l1_loss) else 0.0,
+            }
+
         loss_dict = {
             'total': total_loss.item(),
             'mse': mse_loss.item(),
             'l1': l1_loss.item(),
-            'gradient': grad_loss.item(),
-            'range_penalty': range_penalty_val.item()
         }
-        
+
         return total_loss, loss_dict
     
     

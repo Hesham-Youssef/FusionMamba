@@ -9,21 +9,31 @@ from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 
 
 class SingleMambaBlock(nn.Module):
+    """
+    ✅ FIXED: Properly handles (B, C, H, W) input
+    """
     def __init__(self, dim, H, W):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
-        # self.norm1 = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=8, bimamba_type='v6', 
-                           if_devide_out=False, use_norm=True, input_h=H, input_w=W)
+        self.block = Mamba(
+            dim, 
+            expand=2, 
+            d_state=16, 
+            bimamba_type='v6', 
+            if_devide_out=False, 
+            use_norm=False, 
+            input_h=H, 
+            input_w=W
+        )
 
     def forward(self, input):
-        # input: (B, N, C)
+        B, C, H, W = input.shape        
         skip = input
+        input = rearrange(input, 'b c h w -> b (h w) c')
         input = self.norm(input)
         output = self.block(input)
-        # output = self.norm1(output)
+        output = rearrange(output, 'b (h w) c -> b c h w', h=H, w=W)
         return output + skip
-
 
 
 class CrossMambaBlock(nn.Module):
@@ -31,9 +41,8 @@ class CrossMambaBlock(nn.Module):
         super().__init__()
         self.norm0 = nn.LayerNorm(dim)
         self.norm1 = nn.LayerNorm(dim)
-        # self.norm2 = nn.LayerNorm(dim)
-        self.block = Mamba(dim, expand=1, d_state=8, bimamba_type='v7', 
-                           if_devide_out=False, use_norm=True, input_h=H, input_w=W)
+        self.block = Mamba(dim, expand=2, d_state=30, bimamba_type='v7', 
+                           if_devide_out=False, use_norm=False, input_h=H, input_w=W)
 
     def forward(self, input0, input1):
         # input0: (B, N, C) | input1: (B, N, C)
@@ -41,7 +50,6 @@ class CrossMambaBlock(nn.Module):
         input0 = self.norm0(input0)
         input1 = self.norm1(input1)
         output = self.block(input0, extra_emb=input1)
-        # output = self.norm2(output)
         return output + skip
 
 class FusionMamba(nn.Module):

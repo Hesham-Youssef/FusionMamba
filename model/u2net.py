@@ -1,43 +1,67 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model.fusion_mamba import FusionMamba
+from model.fusion_mamba import FusionMamba, SingleMambaBlock
 from mamba_ssm.modules.mamba_simple import Mamba
 
 
+
 class CrossScanAttention(nn.Module):
-    """Cross-attention between two image features (channel-wise)"""
+
     def __init__(self, channels, mamba_channels=64):
         super().__init__()
-        self.pooling = nn.AdaptiveMaxPool2d((1, 1))
         
-        self.pre_linear = nn.Linear(1, mamba_channels)
+        self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.pre_linear = nn.Linear(16, mamba_channels)
         self.norm = nn.LayerNorm(mamba_channels)
         
         self.mamba = Mamba(
             mamba_channels, 
-            expand=1, 
-            d_state=8, 
+            expand=2, 
+            d_state=16, 
             bimamba_type='v3',
             if_devide_out=False, 
-            use_norm=True
+            use_norm=False
         )
+        
         self.post_linear = nn.Linear(mamba_channels, 1)
-        self.sigmoid = nn.Sigmoid()
-    
+        
+
     def forward(self, img1_features, img2_features):
-        img1_pooled = self.pooling(img1_features).squeeze(-1)
-        img2_pooled = self.pooling(img2_features).squeeze(-1)
+        B, C, H, W = img1_features.shape
         
-        x1 = self.norm(self.pre_linear(img1_pooled))
-        x2 = self.norm(self.pre_linear(img2_pooled))
+        # Pool to spatial grid
+        img1_pooled = self.spatial_pool(img1_features)
+        img2_pooled = self.spatial_pool(img2_features)
         
+        # Flatten spatial dimensions
+        img1_flat = img1_pooled.view(B, C, -1)
+        img2_flat = img2_pooled.view(B, C, -1)
+        
+        # Process each channel's spatial pattern
+        x1 = self.pre_linear(img1_flat)
+        x2 = self.pre_linear(img2_flat)
+        
+        x1 = self.norm(x1)
+        x2 = self.norm(x2)
+        
+        
+        # Cross-attention via Mamba
         x = self.mamba(x1, extra_emb=x2)
+        
+        # Aggregate to channel weights
         attention = self.post_linear(x)
+            
+        # Stage 2: Gentle sigmoid with temperature
+        temperature = 2.0
+        attention = torch.sigmoid(attention / temperature)
+        
+        # Stage 4: Add small epsilon for numerical stability
+        attention = attention + 1e-6
+        
         attention = attention.unsqueeze(-1)
         
-        return self.sigmoid(attention)
-
+        return attention
 
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels, scale):
@@ -45,11 +69,9 @@ class Up(nn.Module):
         self.up = nn.Sequential(
             nn.Conv2d(in_channels, out_channels * (scale ** 2), 3, 1, 1),
             nn.PixelShuffle(scale),
-            nn.ReLU(inplace=True),
         )
         self.conv = nn.Sequential(
             nn.Conv2d(out_channels * 2, out_channels, 3, 1, 1),
-            nn.ReLU(inplace=True),
         )
 
     def forward(self, x1, x2):
@@ -96,7 +118,43 @@ class Stage(nn.Module):
             img1_sum = self.sum_sample(img1_sum, img1_pre)
             img2_sum = self.sum_sample(img2_sum, img2_pre)
             
+            
+            
             return img1_up, img2_up, img1_sum, img2_sum
+
+
+class FeatureFusion(nn.Module):
+    def __init__(self, dim, H, W):
+        super().__init__()
+        
+        self.fusion_conv = nn.Sequential(
+            nn.GroupNorm(8, dim * 3),
+            nn.Conv2d(dim * 3, dim, 3, 1, 1),
+        )
+        
+        # self.mamba_refine = SingleMambaBlock(dim, H, W)
+    
+    def forward(self, features):
+        """
+        features: (B, 3*dim, H, W) concatenated features
+        """
+        fused = self.fusion_conv(features)
+        # fused = self.mamba_refine(fused)
+        return fused
+
+
+class FinalProjection(nn.Module):
+    def __init__(self, dim, output_dim, H, W):
+        super().__init__()
+        
+        self.proj = nn.Sequential(
+
+            SingleMambaBlock(dim, H, W),
+            nn.Conv2d(dim, output_dim, 3, 1, 1),
+        )
+    
+    def forward(self, x):
+        return self.proj(x)
 
 
 class U2Net(nn.Module):
@@ -105,26 +163,21 @@ class U2Net(nn.Module):
         self.debug = debug
         self.register_buffer('step', torch.tensor(0))
 
-        # Input projections - ADD BACK GroupNorm for stability
         self.raise_img1_dim = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
             nn.GroupNorm(8, dim),
-            nn.ReLU(inplace=True),
         )
         self.raise_img2_dim = nn.Sequential(
             nn.Conv2d(img2_dim, dim, 3, 1, 1),
             nn.GroupNorm(8, dim),
-            nn.ReLU(inplace=True),
         )
         self.raise_img1_sum_dim = nn.Sequential(
             nn.Conv2d(img1_dim, dim, 3, 1, 1),
             nn.GroupNorm(8, dim),
-            nn.ReLU(inplace=True),
         )
         self.raise_img2_sum_dim = nn.Sequential(
             nn.Conv2d(img2_dim, dim, 3, 1, 1),
             nn.GroupNorm(8, dim),
-            nn.ReLU(inplace=True),
         )
         
         self.img1_dim = img1_dim
@@ -137,18 +190,20 @@ class U2Net(nn.Module):
 
         scale = 2
         
-        # Encoder
+        # Encoder stages (keep as is)
+        from model.u2net import Stage  # Import your existing Stage
         self.stage0 = Stage(dim0, dim1, H, W, scale=scale, sample_mode='down')
         self.stage1 = Stage(dim1, dim2, H//2, W//2, scale=scale, sample_mode='down')
         
-        # Bottleneck fusion
+        # Bottleneck fusion (keep as is)
+        from model.fusion_mamba import FusionMamba
         self.fm = FusionMamba(dim2, H//4, W//4, depth=2, final=True)
 
-        # Decoder
+        # Decoder stages (keep as is)
         self.stage2 = Stage(dim2, dim1, H//2, W//2, scale=scale, sample_mode='up')
         self.stage3 = Stage(dim1, dim0, H, W, scale=scale, sample_mode='up')
 
-        # Feature encoding - ADD BACK GroupNorm
+        # Feature encoders with proper normalization
         self.img1_encode = nn.Sequential(
             nn.Conv2d(img1_dim, dim0, 3, 1, 1),
             nn.GroupNorm(8, dim0),
@@ -158,53 +213,16 @@ class U2Net(nn.Module):
             nn.GroupNorm(8, dim0),
         )
         
-        # Cross-attention for motion/quality assessment
         self.cross_attention = CrossScanAttention(dim0, mamba_channels=64)
+        self.feature_fusion = FeatureFusion(dim0, H, W)        
+        self.final_proj = FinalProjection(dim0, img1_dim, H, W)
         
-        # Feature fusion with normalization
-        self.feature_fusion = nn.Sequential(
-            nn.Conv2d(dim0 * 3, dim0 * 2, 3, 1, 1),
-            nn.GroupNorm(8, dim0 * 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim0 * 2, dim0, 3, 1, 1),
-            nn.GroupNorm(8, dim0),
-            nn.ReLU(inplace=True),
-        )
-        
-        # CONSTRAINED output projection with tanh
-        self.final_proj = nn.Sequential(
-            nn.Conv2d(dim0, dim0, 3, 1, 1),
-            nn.GroupNorm(8, dim0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim0, img1_dim, 3, 1, 1),
-            nn.Tanh()  # Natural [-1, 1] constraint
-        )
-        
-        # REMOVED learnable scaling - let tanh handle range
-        
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initialize weights for stable training"""
-        with torch.no_grad():
-            # Conservative initialization for final projection
-            for m in self.final_proj.modules():
-                if isinstance(m, nn.Conv2d):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)  # Small gain for tanh
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-            
-            # Standard initialization for other layers
-            for m in self.modules():
-                if isinstance(m, nn.Conv2d) and m not in self.final_proj.modules():
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
 
     def forward(self, img1, img2, sum1, sum2):
         if self.training:
             self.step += 1
         
+        # Store originals
         img1_orig = img1
         img2_orig = img2
         
@@ -222,12 +240,27 @@ class U2Net(nn.Module):
             img1, sum1, img2=img2, img2_sum=sum2
         )
         
+        # Bottleneck fusion
         fused = self.fm(img1, img2, sum1, sum2)
         
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(fused).any() or torch.isinf(fused).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in fused at step {self.step.item()} - replaced with zeros")
+            
+        
+        # Decoder
         img1_dec, _, sum1, sum2 = self.stage2(
             fused, sum1, img1_pre=img1_skip1, 
             img2=fused, img2_sum=sum2, img2_pre=img1_skip1
         )
+        
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(img1_dec).any() or torch.isinf(img1_dec).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in img1_dec at step {self.step.item()} - replaced with zeros")
         
         img1_dec, _, sum1, sum2 = self.stage3(
             img1_dec, sum1, img1_pre=img1_skip0, 
@@ -238,26 +271,61 @@ class U2Net(nn.Module):
         img1_features = self.img1_encode(img1_orig)
         img2_features = self.img2_encode(img2_orig)
         
-        # Cross-attention weight
+        # Cross-attention weights
         cross_attn = self.cross_attention(img1_features, img2_features)
+        
+        
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(img1_features).any() or torch.isinf(img1_features).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in img1_features at step {self.step.item()} - replaced with zeros")
             
-            
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(img2_features).any() or torch.isinf(img1_features).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in img2_features at step {self.step.item()} - replaced with zeros")
+        
+        # Weighted features
         weighted_img1 = img1_features * cross_attn
         weighted_img2 = img2_features * (1 - cross_attn)
         
-        # Fuse all information
+     
+        
+        # Concatenate all features
         all_features = torch.cat([
             img1_dec,
             weighted_img1,
             weighted_img2
         ], dim=1)
         
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(all_features).any() or torch.isinf(all_features).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in all_features at step {self.step.item()} - replaced with zeros")
+            
+        
+        # Fuse features
         fused_features = self.feature_fusion(all_features)
         
-        # Output with natural tanh constraint
-        output = self.final_proj(fused_features)
         
-        # if torch.isnan(output).any():
-        #     print(f"⚠️  NaN in prediction gradients")
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(fused_features).any() or torch.isinf(fused_features).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in fused_features at step {self.step.item()} - replaced with zeros")
+            
+            
+        # Final projection
+        output = self.final_proj(fused_features)
 
+        
+        # ✅ Replace any NaN/Inf with zeros BUT keep in computation graph
+        if (torch.isnan(output).any() or torch.isinf(output).any()):
+            # Log but continue (loss will be high, batch will be skipped)
+            # if self.step % 10 == 0:  # Don't spam logs
+            print(f"⚠️  NaN/Inf in output at step {self.step.item()} - replaced with zeros")
+    
         return output

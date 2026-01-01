@@ -14,15 +14,16 @@ class Configs:
         self.c_dim = 3  # RGB channels
         self.num_shots = 3
         
-        # Training parameters - CRITICAL FIXES
-        self.batch_size = 64  # REDUCED from 110 for better gradient stability
-        self.learning_rate = 5e-5  # LOWERED from 2e-4 to prevent overshooting
+        self.batch_size = 45
+        self.learning_rate = 1e-3
         self.beta1 = 0.9
         self.beta2 = 0.999
-        self.epoch = 150
+        self.epoch = 75
         
-        # Gradient accumulation for larger effective batch size
-        self.accumulation_steps = 2  # Effective batch = 64 * 2 = 128
+        self.lr_warmup_epochs = 3
+        self.max_lr = 3e-3        
+        
+        self.enable_shuffle = True
         
         # Data processing
         self.patch_size = [64, 64]
@@ -47,7 +48,7 @@ class Configs:
         
         # Training optimizations
         self.use_mixed_precision = True  # AMP for faster training
-        self.gradient_clip_norm = 1.0  # Gradient clipping
+        self.gradient_clip_norm = 1000.0  # Gradient clipping
         
     def __str__(self):
         """Print configuration"""
@@ -67,11 +68,3 @@ class Configs:
 if __name__ == '__main__':
     configs = Configs()
     print(configs)
-    
-    print("\n🔧 Key Changes from Default:")
-    print("-" * 60)
-    print("1. ✅ Learning rate: 2e-4 → 5e-5 (prevents overshooting)")
-    print("2. ✅ Batch size: 110 → 64 (better gradient quality)")
-    print("3. ✅ Added accumulation_steps=2 (effective batch=128)")
-    print("4. ✅ Added loss_config with range penalty")
-    print("5. ✅ High range_penalty_weight=3.0 (enforces [-1,1] bounds)")
