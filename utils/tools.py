@@ -188,15 +188,18 @@ def transform(image, image_size, is_crop, is_hdr=False):
     
     return out.astype(np.float32)
 
+
 def inverse_transform(images, MU=5000.0):
     compressed = (images + 1.0) / 2.0
+    compressed = torch.clamp(compressed, 0.0, 1.0)
     hdr_radiance = (torch.pow(1.0 + MU, compressed) - 1.0) / MU
     return hdr_radiance
 
 def inverse_transform_np(images, MU=5000.0):
-    compressed = np.clip((images + 1.0) / 2.0, 0.0, 1.0)  # <- clip
+    compressed = np.clip((images + 1.0) / 2.0, 0.0, 1.0)
     hdr_radiance = (np.power(1.0 + MU, compressed) - 1.0) / MU
     return hdr_radiance
+
 
 
 def dump_sample(sample_path, img):

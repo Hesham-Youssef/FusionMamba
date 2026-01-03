@@ -1,5 +1,5 @@
 """
-U2Net Configuration - Optimized for HDR Reconstruction
+U2Net Configuration - Fixed for Stable Training
 """
 
 class Configs:
@@ -10,18 +10,21 @@ class Configs:
         self.sample_dir = './samples/u2net'
         
         # Model architecture parameters
-        self.dim = 32  # Base dimension
+        self.dim = (32 * 3)  # Base dimension
         self.c_dim = 3  # RGB channels
         self.num_shots = 3
         
-        self.batch_size = 45
-        self.learning_rate = 1e-3
+        self.batch_size = 30
+        
+        self.learning_rate = 1e-4      # Initial LR
+        self.max_lr = 1e-3             # Max LR for scheduler
+        self.min_lr = 1e-5             # Minimum LR
+        
         self.beta1 = 0.9
         self.beta2 = 0.999
-        self.epoch = 75
+        self.epoch = 100
         
-        self.lr_warmup_epochs = 3
-        self.max_lr = 3e-3        
+        self.lr_warmup_epochs = 5  # Longer warmup
         
         self.enable_shuffle = True
         
@@ -37,18 +40,14 @@ class Configs:
         # Reproducibility
         self.seed = 42
         
-        # Loss function weights - NEW
-        self.loss_config = {
-            'type': 'improved',  # Use improved loss with SSIM + gradient
-            'l1_weight': 1.0,
-            'gradient_weight': 0.3,
-            'range_penalty_weight': 3.0,  # HIGH penalty for range violations
-            'ssim_weight': 0.0,  # Start with 0, can increase later if stable
-        }
+        # ✅ FIXED: Simplified loss weights
+        self.MU = 5000.0  # Mu-law compression parameter
         
         # Training optimizations
-        self.use_mixed_precision = True  # AMP for faster training
-        self.gradient_clip_norm = 1000.0  # Gradient clipping
+        self.use_mixed_precision = True
+        self.gradient_clip_norm = 100.0  # ✅ CRITICAL: Much lower clip threshold
+        
+        self.weight_decay = 1e-4  # Higher regularization
         
     def __str__(self):
         """Print configuration"""

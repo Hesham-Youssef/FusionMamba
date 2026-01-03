@@ -82,7 +82,7 @@ def eval_one_epoch(epoch, save_outputs=True, enable_shuffle=True):
 
     patch_h, patch_w = configs.patch_size
     stride = patch_h // 2
-    PATCH_CHUNK = 100
+    PATCH_CHUNK = 60
     pad_size = stride // 2
 
     pbar = tqdm(test_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Eval]')
@@ -237,12 +237,12 @@ def print_grad_stats(model, prefix=""):
     
     
 def train_one_epoch(epoch):
-    """Enhanced version with comprehensive logging"""
+    """Enhanced training loop"""
     model.train()
     epoch_loss = 0.0
     epoch_loss_dict = {}
     skipped_batches = 0
-    grad_norms = []  # ✅ Track gradient norms
+    grad_norms = []
 
     pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{configs.epoch} [Train]')
 
@@ -284,16 +284,13 @@ def train_one_epoch(epoch):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
-            # ✅ Track gradient norm BEFORE clipping
+            # Track gradient norm
             total_norm = 0.0
             for p in model.parameters():
                 if p.grad is not None:
                     total_norm += p.grad.data.norm(2).item() ** 2
             total_norm = total_norm ** 0.5
             grad_norms.append(total_norm)
-            
-            if idx % 10 == 0:
-                print(f"[Epoch {epoch+1} | Batch {idx}] GRAD_NORM = {total_norm:.6f}")
             
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), 
@@ -317,6 +314,12 @@ def train_one_epoch(epoch):
                                           max_norm=configs.gradient_clip_norm)
             optimizer.step()
 
+        # ✅ CRITICAL: Step scheduler AFTER each batch
+        lr_scheduler.step()
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Update metrics
         epoch_loss += loss.item()
         for key, value in loss_dict.items():
@@ -327,7 +330,8 @@ def train_one_epoch(epoch):
             'loss': f'{loss.item():.4f}',
             'l1': f'{loss_dict["l1"]:.4f}',
             'pred': f'[{result.min():.2f},{result.max():.2f}]',
-            'grad': f'{total_norm:.2f}'  # ✅ Show gradient norm
+            'grad': f'{total_norm:.2f}',
+            'lr': f'{current_lr:.2e}'  # Show current LR
         })
 
         # TensorBoard logging
@@ -336,10 +340,9 @@ def train_one_epoch(epoch):
             writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
             writer.add_scalar('Train/L1Loss', loss_dict['l1'], global_step)
             writer.add_scalar('Train/GradNorm', total_norm, global_step)
-            writer.add_scalar('Train/PredRange', 
-                            result.max().item() - result.min().item(), global_step)
+            writer.add_scalar('Train/LearningRate', current_lr, global_step)
 
-    # ✅ Epoch summary statistics
+    # Epoch summary
     if skipped_batches > 0:
         logger.log(f"⚠️  Skipped {skipped_batches}/{len(train_dataloader)} batches")
 
@@ -350,24 +353,44 @@ def train_one_epoch(epoch):
         for key, value in epoch_loss_dict.items()
     }
     
-    # ✅ Gradient statistics
+    # Gradient statistics
     if grad_norms:
         avg_grad = np.mean(grad_norms)
         max_grad = np.max(grad_norms)
         logger.log(f"Gradient Stats - Avg: {avg_grad:.4f}, Max: {max_grad:.4f}, "
                    f"Clip: {configs.gradient_clip_norm}")
-        
-        # Warning if clipping too much
-        if avg_grad > configs.gradient_clip_norm * 0.8:
-            logger.log(f"⚠️  Average gradient near clip threshold - "
-                      f"consider increasing clip norm")
 
     return avg_loss, avg_loss_dict
-
 
 # =============================================================================
 # Main Training Script
 # =============================================================================
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, 
+                                    min_lr=1e-5, last_epoch=-1):
+    """
+    Create a schedule with linear warmup and cosine decay.
+    Args:
+        optimizer: The optimizer to schedule
+        num_warmup_steps: Number of warmup steps
+        num_training_steps: Total number of training steps
+        min_lr: Minimum learning rate (never goes below this)
+        last_epoch: The index of the last epoch
+    """
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, num_warmup_steps))
+        
+        # Cosine annealing after warmup
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        # Ensure we never go below min_lr
+        min_lr_ratio = min_lr / optimizer.defaults['lr']
+        return max(min_lr_ratio, cosine_decay)
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 # Get configurations
 configs = Configs()
@@ -439,6 +462,17 @@ W = configs.patch_size[1]
 
 model = U2Net(dim=dim, img1_dim=img1_dim, img2_dim=img2_dim, H=H, W=W)
 
+def make_forward_hook(name):
+    def hook(module, inp, out):
+        if torch.is_tensor(out):
+            if torch.isnan(out).any() or torch.isinf(out).any():
+                print(f"*** NaN/Inf in {name}: min={out.min().item()}, max={out.max().item()}, sum_nan={torch.isnan(out).sum().item()}")
+    return hook
+
+for name, m in model.named_modules():
+    m.register_forward_hook(make_forward_hook(name))
+
+
 total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 logger.log(f"Total parameters: {total_params:,}")
@@ -470,7 +504,7 @@ optimizer = optim.AdamW(
     model.parameters(),
     betas=(configs.beta1, configs.beta2),
     lr=configs.learning_rate,
-    weight_decay=1e-4
+    # weight_decay=configs.weight_decay
 )
 
 logger.log(f"Optimizer: AdamW (lr={configs.learning_rate})")
@@ -480,13 +514,13 @@ criterion = HDRLoss(use_shuffling=configs.enable_shuffle, MU=configs.MU if hasat
 
 # Learning rate scheduler
 steps_per_epoch = len(train_dataloader)
-total_steps = configs.epoch * steps_per_epoch
+total_training_steps = configs.epoch * steps_per_epoch
 warmup_steps = configs.lr_warmup_epochs * steps_per_epoch
-lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+lr_scheduler = get_cosine_schedule_with_warmup(
     optimizer,
-    T_0=5,           # Restart every 50 epochs
-    T_mult=1,         # Keep same cycle length
-    eta_min=1e-5      # Minimum LR
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_training_steps,
+    min_lr=configs.min_lr
 )
 
 # Load checkpoint
@@ -506,7 +540,11 @@ if os.path.isfile(checkpoint_file):
     # ✅ Load scaler state if available
     if 'scaler' in checkpoint and configs.use_mixed_precision:
         scaler.load_state_dict(checkpoint['scaler'])
-        
+    
+    eval_one_epoch(
+        0, 
+        enable_shuffle=configs.enable_shuffle
+    )
     logger.log(f"Loaded checkpoint (epoch {start_epoch}, best loss: {best_loss:.6f})")
 else:
     logger.log("No checkpoint found, starting from scratch")
@@ -607,9 +645,7 @@ def train(start_epoch):
         writer.add_scalar('Train/EpochLoss', train_loss, epoch)
         writer.add_scalar('Train/LearningRate', current_lr, epoch)
         
-        # Step scheduler
-        lr_scheduler.step()
-        
+
         # Save checkpoint
         save_checkpoint(epoch, train_loss, best_loss, optimizer, model, lr_scheduler, False)
         
@@ -617,25 +653,34 @@ def train(start_epoch):
         torch.cuda.empty_cache()
         gc.collect()
         
-        # Evaluate
-        if (epoch + 1) % 50 == 0:
-            with torch.no_grad():
-                eval_loss, eval_loss_dict = eval_one_epoch(
-                    epoch, 
-                    enable_shuffle=configs.enable_shuffle
-                )
-                logger.log(f"Eval Loss: {eval_loss:.8f}")
-                writer.add_scalar('Eval/Loss', eval_loss, epoch)
+        # # Evaluate
+        # if (epoch + 1) % 50 == 0:
+        #     with torch.no_grad():
+        #         eval_loss, eval_loss_dict = eval_one_epoch(
+        #             epoch, 
+        #             enable_shuffle=configs.enable_shuffle
+        #         )
+        #         logger.log(f"Eval Loss: {eval_loss:.8f}")
+        #         writer.add_scalar('Eval/Loss', eval_loss, epoch)
         
-                is_best = eval_loss < best_loss
-                if is_best:
-                    logger.log(f"🎉 New best! {best_loss:.8f} → {eval_loss:.8f}")
-                    best_loss = eval_loss
-                    save_checkpoint(epoch, eval_loss, best_loss, optimizer, model, lr_scheduler, True)
+        #         is_best = eval_loss < best_loss
+        #         if is_best:
+        #             logger.log(f"🎉 New best! {best_loss:.8f} → {eval_loss:.8f}")
+        #             best_loss = eval_loss
+        #             save_checkpoint(epoch, eval_loss, best_loss, optimizer, model, lr_scheduler, True)
         
         epoch_time = time.time() - epoch_start_time
         logger.log(f"Epoch time: {epoch_time:.2f}s")
     
+    
+    if((configs.epoch + 1) % 50 != 0):
+        with torch.no_grad():
+            eval_loss, eval_loss_dict = eval_one_epoch(
+                configs.epoch, 
+                enable_shuffle=configs.enable_shuffle
+            )
+            logger.log(f"Eval Loss: {eval_loss:.8f}")
+                
     total_time = time.time() - training_start_time
     logger.log("\n" + "="*80)
     logger.log("Training Completed!")
